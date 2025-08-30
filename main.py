@@ -1,0 +1,1 @@
+# main.py # --- MODYFIKACJA: Konfiguracja Klienta pod OpenRouter --- client = openai.OpenAI( base_url="https://openrouter.ai/api/v1", api_key="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" # <--- WAŻNA ZMIANA )
