@@ -9,7 +9,7 @@ import openai
 # --- Tworzenie Aplikacji ---
 app = FastAPI(
     title="APO-Orchestrator API",
-    description="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",
+    description="API zarządzające logiką i bezpieczeństwem agenta APO.", # <--- POPRAWIONY OPIS
     version="2.0.0",
 )
 
@@ -48,7 +48,6 @@ def wywolaj_llm_z_promptem(prompt: str, model_do_zadania: str) -> str:
     """Wywołuje wybrany model LLM przez bramkę OpenRouter."""
     try:
         print(f"--- WYWOŁANIE MODELU '{model_do_zadania}' PRZEZ OPENROUTER ---")
-        # W docelowym rozwiązaniu tutaj powinno znaleźć się rzeczywiste wywołanie API
         response = client.chat.completions.create(
             model=model_do_zadania,
             messages=[{"role": "user", "content": prompt}]
