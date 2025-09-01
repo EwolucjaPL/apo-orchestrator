@@ -1,112 +1,116 @@
 import os
-import json
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from openai import AsyncOpenAI
-from dotenv import load_dotenv
-import uvicorn
+async def _inner() -> str:
+client = get_client()
+resp = await client.chat.completions.create(
+model=model,
+messages=[{"role": "user", "content": prompt}],
+temperature=0.0,
+)
+return resp.choices[0].message.content
 
-# --- KONFIGURACJA ---
-load_dotenv()
-app = FastAPI()
 
-# --- ZMIANA ARCHITEKTONICZNA: Leniwa Inicjalizacja Klienta AI ---
-_client = None
+try:
+return await asyncio.wait_for(_inner(), timeout=timeout)
+except asyncio.TimeoutError:
+raise HTTPException(status_code=504, detail="Timeout podczas wywołania modelu AI")
+except Exception as e:
+raise HTTPException(status_code=502, detail=f"Błąd wywołania modelu AI: {e}")
 
-def get_client():
-    """Tworzy klienta AI przy pierwszym użyciu, co gwarantuje, że zmienne środowiskowe są już załadowane."""
-    global _client
-    if _client is None:
-        api_key = os.getenv("OPENROUTER_API_KEY")
-        if not api_key:
-            print("KRYTYCZNY BŁĄD: Zmienna środowiskowa OPENROUTER_API_KEY nie jest ustawiona lub jest pusta!")
-            raise ValueError("API key for OpenRouter is not configured.")
-        
-        _client = AsyncOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=api_key,
-        )
-    return _client
 
-# --- MIKRO-INSTRUKCJE (PROMPTY W JĘZYKU ANGIELSKIM DLA PRECYZJI) ---
-PROMPT_KATEGORYZACJA = """
-Your only task is to assess if the following query is exclusively about Polish educational law. Your domain includes: Teacher's Charter, school management, student rights, pedagogical supervision. Topics like general civil law, copyright law, construction law, or public procurement law are OUTSIDE YOUR DOMAIN. Answer only 'TAK' or 'NIE'.
-Query: "{query}"
-"""
 
-PROMPT_ANALIZA_ZAPYTANIA = """
-Your task is to decompose the user's query into a simple action plan in JSON format. Analyze the query and return a JSON with a list of tasks. Allowed tasks are: 'analiza_prawna', 'weryfikacja_cytatu', 'biuletyn_informacyjny'.
 
-Query: "{query}"
-"""
+def sanitize_component(text: Optional[str]) -> str:
+if not text:
+return ""
+# usuwamy potencjalne próby sterowania modelem
+text = re.sub(r"```.*?```", " ", text, flags=re.S)
+text = re.sub(r"(^|\n)\s*#{1,6}.*", " ", text) # nagłówki
+text = text.replace("<|system|>", "").replace("<|assistant|>", "").replace("<|user|>", "")
+return text.strip()
 
-PROMPT_SYNTEZA_ODPOWIEDZI = """
-You are an editor in a law firm specializing in educational law. Your task is to assemble the following verified components into a single, coherent, professional, and clear response in Markdown format for a client. The response MUST be in Polish.
 
-Here are the components:
-- Legal analysis from the knowledge base: {analiza_prawna}
-- Citation verification result: {wynik_weryfikacji}
-- Information from the news bulletin (latest changes): {biuletyn_informacyjny}
 
-Create a response that is readable and helpful for a school principal or teacher.
-"""
 
-# --- MODELE DANYCH (PYDANTIC) ---
-class QueryRequest(BaseModel):
-    query: str
-
-class SynthesisRequest(BaseModel):
-    analiza_prawna: str | None = None
-    wynik_weryfikacji: str | None = None
-    biuletyn_informacyjny: str | None = None
-
-# --- FUNKCJE POMOCNICZE ---
-async def llm_call(prompt: str, model: str = "openai/gpt-4o"):
-    try:
-        client = get_client()
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        print(f"Błąd podczas wywołania LLM: {e}")
-        raise HTTPException(status_code=500, detail=f"AI model call error: {e}")
-
-# --- ENDPOINTY API ---
+# --------------------------------------------------------------------------------------
+# ENDPOINTY API
+# --------------------------------------------------------------------------------------
 @app.get("/health")
-def health_check():
-    """Endpoint używany przez Render do sprawdzania, czy aplikacja działa."""
-    return {"status": "ok"}
+def health_check() -> Dict[str, Any]:
+return {
+"status": "ok",
+"entries": len(_ENTRIES),
+"kb_version": _INDEX_METADATA.get("version"),
+}
+
+
+
 
 @app.post("/analyze-query")
-async def analyze_query(request: QueryRequest):
-    """Krok 1: Kategoryzuje zapytanie i tworzy plan działania."""
-    prompt_kategoryzacji = PROMPT_KATEGORYZACJA.format(query=request.query)
-    kategoria = await llm_call(prompt_kategoryzacji, model="mistralai/mistral-7b-instruct:free")
+async def analyze_query(request: QueryRequest) -> Dict[str, Any]:
+# 1) Kategoryzacja (TAK/NIE – twarde porównanie)
+k_prompt = PROMPT_KATEGORYZACJA.format(query=request.query)
+k_raw = (await llm_call(k_prompt, model=LLM_PLANNER_MODEL)).strip().upper()
+k_value = "TAK" if k_raw == "TAK" else ("NIE" if k_raw == "NIE" else "TAK")
+if k_value == "NIE":
+return {"zadania": ["ODRZUCONE_SPOZA_DOMENY"]}
 
-    if "NIE" in kategoria.upper():
-        return {"zadania": ["ODRZUCONE_SPOZA_DOMENY"]}
-    
-    prompt_analizy = PROMPT_ANALIZA_ZAPYTANIA.format(query=request.query)
-    plan_json_str = await llm_call(prompt_analizy)
-    try:
-        plan_zadania = json.loads(plan_json_str)
-        return plan_zadania
-    except json.JSONDecodeError:
-        return {"zadania": ["analiza_prawna"]}
+
+# 2) Plan zadań (wymuszony JSON + walidacja)
+p_prompt = PROMPT_ANALIZA_ZAPYTANIA.format(query=request.query)
+p_raw = await llm_call(p_prompt, model=LLM_PLANNER_MODEL)
+
+
+# wyłuskanie pierwszego poprawnego bloku JSON
+m = re.search(r"\{[\s\S]*\}", p_raw)
+plan_json = m.group(0) if m else '{"zadania":["analiza_prawna"]}'
+try:
+plan = PlanZadania.model_validate_json(plan_json)
+except ValidationError:
+plan = PlanZadania(zadania=["analiza_prawna"])
+
+
+return plan.model_dump()
+
+
+
+
+@app.get("/knowledge/search", response_model=List[SearchHit])
+async def knowledge_search(q: str = Query(..., min_length=2), k: int = Query(MAX_RETURN_SNIPPETS, ge=1, le=10)):
+return search_entries(q, k=k)
+
+
+
 
 @app.post("/gate-and-format-response")
-async def gate_and_format_response(request: SynthesisRequest):
-    """Krok Ostatni: Składa komponenty i egzekwuje reguły bezpieczeństwa."""
-    if request.analiza_prawna == "ODRZUCONE_SPOZA_DOMENY":
-        return "Dziękuję za Twoje pytanie. Nazywam się Asystent Prawa Oświatowego, a moja wiedza jest specjalistycznie ograniczona wyłącznie do zagadnień polskiego prawa oświatowego. Twoje pytanie dotyczy innej dziedziny prawa i wykracza poza ten zakres. Nie mogę udzielić informacji na ten temat."
+async def gate_and_format_response(request: SynthesisRequest) -> str:
+if request.analiza_prawna == "ODRZUCONE_SPOZA_DOMENY":
+return (
+"Dziękuję za Twoje pytanie. Nazywam się Asystent Prawa Oświatowego, a moja wiedza "
+"jest ograniczona wyłącznie do zagadnień polskiego prawa oświatowego. Twoje pytanie "
+"wykracza poza ten zakres – nie mogę udzielić informacji na ten temat."
+)
 
-    prompt_syntezy = PROMPT_SYNTEZA_ODPOWIEDZI.format(
-        analiza_prawna=request.analiza_prawna or "Brak danych.",
-        wynik_weryfikacji=request.wynik_weryfikacji or "Nie dotyczy.",
-        biuletyn_informacyjny=request.biuletyn_informacyjny or "Brak danych."
-    )
-    final_response = await llm_call(prompt_syntezy)
-    return final_response
+
+analiza = sanitize_component(request.analiza_prawna)
+wery = sanitize_component(request.wynik_weryfikacji)
+biul = sanitize_component(request.biuletyn_informacyjny)
+
+
+prompt = PROMPT_SYNTEZA_ODPOWIEDZI.format(
+analiza_prawna=analiza or "(brak danych z bazy – użyj ogólnych zasad i zaznacz niepewność)",
+wynik_weryfikacji=wery or "(brak danych)",
+biuletyn_informacyjny=biul or "(brak danych)",
+)
+return await llm_call(prompt, model=LLM_DEFAULT_MODEL)
+
+
+
+
+# --------------------------------------------------------------------------------------
+# DEV ENTRYPOINT
+# --------------------------------------------------------------------------------------
+if __name__ == "__main__":
+import uvicorn
+
+
+uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
