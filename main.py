@@ -65,16 +65,21 @@ async def llm_call(prompt: str, model: str = "openai/gpt-4o"):
         raise HTTPException(status_code=500, detail=f"AI model call error: {e}")
 
 # --- ENDPOINTY API ---
+
+# --- NOWY ENDPOINT: KONTROLA STANU (HEALTH CHECK) DLA RENDER.COM ---
+@app.get("/health")
+def health_check():
+    """Ten endpoint jest używany przez Render do sprawdzania, czy aplikacja działa."""
+    return {"status": "ok"}
+
 @app.post("/analyze-query")
 async def analyze_query(request: QueryRequest):
     """Krok 1: Kategoryzuje zapytanie i tworzy plan działania."""
     
-    # --- NOWOŚĆ: STRAŻNIK DOMENY (DOMAIN GUARD) Zaimplementowany w kodzie ---
     prompt_kategoryzacji = PROMPT_KATEGORYZACJA.format(query=request.query)
     kategoria = await llm_call(prompt_kategoryzacji, model="mistralai/mistral-7b-instruct:free")
 
     if "NIE" in kategoria.upper():
-        # Zwraca specjalny plan oznaczający odrzucenie
         return {"zadania": ["ODRZUCONE_SPOZA_DOMENY"], "sygnatura": ""}
     
     prompt_analizy = PROMPT_ANALIZA_ZAPYTANIA.format(query=request.query)
@@ -83,16 +88,14 @@ async def analyze_query(request: QueryRequest):
         plan_zadania = json.loads(plan_json_str)
         return plan_zadania
     except json.JSONDecodeError:
-        # Awaryjny plan, jeśli JSON zawiedzie
         return {"zadania": ["analiza_prawna"], "sygnatura": ""}
 
 @app.post("/gate-and-format-response")
 async def gate_and_format_response(request: SynthesisRequest):
     """Krok Ostatni: Składa komponenty i egzekwuje reguły bezpieczeństwa."""
     
-    # Sprawdzenie, czy plan nie został odrzucony na wcześniejszym etapie
     if request.analiza_prawna == "ODRZUCONE_SPOZA_DOMENY":
-        return "Dziękuję za Twoje pytanie. Nazywam się Asystent Prawa Oświatowego, a moja wiedza jest specjalistycznie ograniczona wyłącznie do zagadnień polskiego prawa oświatowego. Twoje pytanie dotyczy innej dziedziny prawa i wykracza poza ten zakres. Nie mogę udzielić informacji na ten temat."
+        return "Dziękuję za Twoje pytanie. Nazywam się Asystent Prawa Oświatowego, a moja wiedza jest specjalistycznie ograniczona wyłącznie do zagadnienie polskiego prawa oświatowego. Twoje pytanie dotyczy innej dziedziny prawa i wykracza poza ten zakres. Nie mogę udzielić informacji na ten temat."
 
     prompt_syntezy = PROMPT_SYNTEZA_ODPOWIEDZI.format(
         analiza_prawna=request.analiza_prawna or "Brak danych.",
