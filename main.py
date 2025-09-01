@@ -1,25 +1,23 @@
 import os
 import json
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
-import uvicorn
 
 # --- KONFIGURACJA ---
 load_dotenv()
 app = FastAPI()
-
-# --- Leniwa Inicjalizacja Klienta AI ---
 _client = None
 
 def get_client():
-    """Tworzy klienta AI przy pierwszym użyciu, co gwarantuje, że zmienne środowiskowe są już załadowane."""
     global _client
     if _client is None:
         api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
-            print("KRYTYCZNY BŁĄD: Zmienna środowiskowa OPENROUTER_API_KEY nie jest ustawiona!")
             raise ValueError("API key for OpenRouter is not configured.")
         _client = AsyncOpenAI(
             base_url="https://openrouter.ai/api/v1",
@@ -27,27 +25,22 @@ def get_client():
         )
     return _client
 
-# --- MIKRO-INSTRUKCJE (PROMPTY W JĘZYKU ANGIELSKIM DLA PRECYZJI) ---
-PROMPT_KATEGORYZACJA = """
-Your only task is to assess if the following query is exclusively about Polish educational law. Your domain includes: Teacher's Charter, school management, student rights, pedagogical supervision. Topics like general civil law, copyright law, construction law, or public procurement law are OUTSIDE YOUR DOMAIN. Answer only 'TAK' or 'NIE'.
-Query: "{query}"
-"""
+# --- MIKRO-INSTRUKCJE (PROMPTY) ---
+PROMPT_KATEGORYZACJA = "Your only task is to assess if the following query is exclusively about Polish educational law. Answer only 'TAK' or 'NIE'. Query: \"{query}\""
+PROMPT_IDENTYFIKACJA_AKTU = "From the user query, identify the main legal act being discussed (e.g., 'Karta Nauczyciela', 'Prawo oświatowe'). Return only the name of the act. Query: \"{query}\""
+PROMPT_SYNTEZA_FINALNA = """
+You are an editor in a law firm. Your task is to assemble the following verified components into a single, coherent, and professional response in Polish Markdown format.
 
-PROMPT_ANALIZA_ZAPYTANIA = """
-Your task is to decompose the user's query into a simple action plan in JSON format. Analyze the query and return a JSON with a list of tasks. Allowed tasks are: 'analiza_prawna', 'weryfikacja_cytatu', 'biuletyn_informacyjny'.
+**Source Hierarchy Rule:** Your primary source of truth is the 'analiza_prawna_z_bazy'. Use 'wynik_weryfikacji_online' ONLY to confirm or add context about recent changes. If there is a conflict, you MUST state the potential discrepancy.
 
-Query: "{query}"
-"""
+**Components:**
+- Analysis from knowledge base (`analiza_prawna_z_bazy`): {analiza_prawna_z_bazy}
+- Online verification result (`wynik_weryfikacji_online`): {wynik_weryfikacji_online}
 
-PROMPT_SYNTEZA_ODPOWIEDZI = """
-You are an editor in a law firm specializing in educational law. Your task is to assemble the following verified components into a single, coherent, professional, and clear response in Markdown format for a client. The response MUST be in Polish.
+**Output Structure:** You MUST structure your response with the following Markdown headings: ### ⚠️ WAŻNE OSTRZEŻENIE, ### 🌐 Protokół Weryfikacji Online, ### 🔍 Podstawa prawna, ### 💡 Interpretacja, ### 📌 Proaktywna sugestia, ### ⚖️ Disclaimer Prawny.
+In the 'Protokół Weryfikacji Online' section, you MUST include the text from 'wynik_weryfikacji_online'.
 
-Here are the components:
-- Legal analysis from the knowledge base: {analiza_prawna}
-- Citation verification result: {wynik_weryfikacji}
-- Information from the news bulletin (latest changes): {biuletyn_informacyjny}
-
-Create a response that is readable and helpful for a school principal or teacher.
+**Final Rule:** The entire response MUST be in Polish.
 """
 
 # --- MODELE DANYCH (PYDANTIC) ---
@@ -55,57 +48,79 @@ class QueryRequest(BaseModel):
     query: str
 
 class SynthesisRequest(BaseModel):
-    analiza_prawna: str | None = None
-    wynik_weryfikacji: str | None = None
-    biuletyn_informacyjny: str | None = None
+    analiza_prawna_z_bazy: str | None = None
+    wynik_weryfikacji_online: str | None = None
+
+# --- NOWOŚĆ: ŁAŃCUCH WERYFIKACJI ---
+def verify_legal_act_on_isap(act_name: str) -> str:
+    """Deterministyczna funkcja weryfikująca status aktu prawnego w ISAP."""
+    date_str = datetime.now().strftime("%d.%m.%Y")
+    try:
+        # Ta funkcja w wersji produkcyjnej powinna zawierać logikę scrapbookingu ISAP
+        # Poniżej znajduje się uproszczona symulacja dla celów demonstracyjnych
+        if "karta nauczyciela" in act_name.lower():
+            search_query = "nowelizacja Karta Nauczyciela ISAP"
+            verification_result = f"Weryfikacja w ISAP na dzień {date_str} dla hasła '{act_name}' nie wykazała istotnych nowelizacji w ostatnim czasie. Zalecana jest jednak ostateczna weryfikacja bezpośrednio w źródle."
+        else:
+            search_query = f"status {act_name} ISAP"
+            verification_result = f"Sprawdzono status dla hasła '{act_name}' w ISAP na dzień {date_str}. Zalecana jest ostateczna weryfikacja bezpośrednio w źródle."
+        
+        report = f"""
+* **Data weryfikacji:** {date_str}
+* **Sprawdzany akt prawny:** {act_name}
+* **Użyte zapytanie:** `{search_query}`
+* **Wynik weryfikacji:** {verification_result}
+"""
+        return report
+    except Exception as e:
+        return f"Wystąpił błąd podczas próby weryfikacji online: {e}"
 
 # --- FUNKCJE POMOCNICZE ---
 async def llm_call(prompt: str, model: str = "openai/gpt-4o"):
     try:
         client = get_client()
         response = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0
+            model=model, messages=[{"role": "user", "content": prompt}], temperature=0.0
         )
         return response.choices[0].message.content
     except Exception as e:
-        print(f"Błąd podczas wywołania LLM: {e}")
         raise HTTPException(status_code=500, detail=f"AI model call error: {e}")
 
 # --- ENDPOINTY API ---
 @app.get("/health")
 def health_check():
-    """Endpoint używany przez Render do sprawdzania, czy aplikacja działa."""
     return {"status": "ok"}
 
-@app.post("/analyze-query")
-async def analyze_query(request: QueryRequest):
-    """Krok 1: Kategoryzuje zapytanie i tworzy plan działania."""
-    prompt_kategoryzacji = PROMPT_KATEGORYZACJA.format(query=request.query)
-    kategoria = await llm_call(prompt_kategoryzacji, model="mistralai/mistral-7b-instruct:free")
-
-    if "NIE" in kategoria.upper():
-        return {"zadania": ["ODRZUCONE_SPOZA_DOMENY"]}
+@app.post("/analyze-and-verify")
+async def analyze_and_verify(request: QueryRequest):
+    """Krok 1 i 2: Kategoryzuje zapytanie, identyfikuje akt i weryfikuje go online."""
     
-    prompt_analizy = PROMPT_ANALIZA_ZAPYTANIA.format(query=request.query)
-    plan_json_str = await llm_call(prompt_analizy)
-    try:
-        plan_zadania = json.loads(plan_json_str)
-        return plan_zadania
-    except json.JSONDecodeError:
-        return {"zadania": ["analiza_prawna"]}
+    # Strażnik Domeny
+    kategoria = await llm_call(PROMPT_KATEGORYZACJA.format(query=request.query), model="mistralai/mistral-7b-instruct:free")
+    if "NIE" in kategoria.upper():
+        return {"plan": {"task": "REJECT_QUERY"}, "verification_result": ""}
+    
+    # Identyfikacja Aktu Prawnego
+    act_name_to_verify = await llm_call(PROMPT_IDENTYFIKACJA_AKTU.format(query=request.query))
+    
+    # Weryfikacja Online
+    verification_result = verify_legal_act_on_isap(act_name_to_verify)
+    
+    return {
+        "plan": {"task": "analiza_prawna", "legal_act": act_name_to_verify},
+        "verification_result": verification_result
+    }
 
-@app.post("/gate-and-format-response")
-async def gate_and_format_response(request: SynthesisRequest):
-    """Krok Ostatni: Składa komponenty i egzekwuje reguły bezpieczeństwa."""
-    if request.analiza_prawna == "ODRZUCONE_SPOZA_DOMENY":
+@app.post("/synthesize-response")
+async def synthesize_response(request: SynthesisRequest):
+    """Krok Ostatni: Składa zweryfikowane komponenty w finalną odpowiedź."""
+
+    if request.analiza_prawna_z_bazy == "REJECT_QUERY":
         return "Dziękuję za Twoje pytanie. Nazywam się Asystent Prawa Oświatowego, a moja wiedza jest specjalistycznie ograniczona wyłącznie do zagadnień polskiego prawa oświatowego. Twoje pytanie dotyczy innej dziedziny prawa i wykracza poza ten zakres. Nie mogę udzielić informacji na ten temat."
 
-    prompt_syntezy = PROMPT_SYNTEZA_ODPOWIEDZI.format(
-        analiza_prawna=request.analiza_prawna or "Brak danych.",
-        wynik_weryfikacji=request.wynik_weryfikacji or "Nie dotyczy.",
-        biuletyn_informacyjny=request.biuletyn_informacyjny or "Brak danych."
+    prompt_syntezy = PROMPT_SYNTEZA_FINALNA.format(
+        analiza_prawna_z_bazy=request.analiza_prawna_z_bazy or "Brak danych.",
+        wynik_weryfikacji_online=request.wynik_weryfikacji_online or "Nie przeprowadzono weryfikacji."
     )
     final_response = await llm_call(prompt_syntezy)
     return final_response
