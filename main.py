@@ -66,11 +66,15 @@ async def llm_call(prompt: str, model: str = "openai/gpt-4o"):
 
 # --- ENDPOINTY API ---
 
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# TUTAJ JEST BRAKUJĄCY FRAGMENT - NALEŻY GO DODAĆ
 # --- NOWY ENDPOINT: KONTROLA STANU (HEALTH CHECK) DLA RENDER.COM ---
 @app.get("/health")
 def health_check():
     """Ten endpoint jest używany przez Render do sprawdzania, czy aplikacja działa."""
     return {"status": "ok"}
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
 
 @app.post("/analyze-query")
 async def analyze_query(request: QueryRequest):
@@ -95,7 +99,7 @@ async def gate_and_format_response(request: SynthesisRequest):
     """Krok Ostatni: Składa komponenty i egzekwuje reguły bezpieczeństwa."""
     
     if request.analiza_prawna == "ODRZUCONE_SPOZA_DOMENY":
-        return "Dziękuję za Twoje pytanie. Nazywam się Asystent Prawa Oświatowego, a moja wiedza jest specjalistycznie ograniczona wyłącznie do zagadnienie polskiego prawa oświatowego. Twoje pytanie dotyczy innej dziedziny prawa i wykracza poza ten zakres. Nie mogę udzielić informacji na ten temat."
+        return "Dziękuję za Twoje pytanie. Nazywam się Asystent Prawa Oświatowego, a moja wiedza jest specjalistycznie ograniczona wyłącznie do zagadnieie polskiego prawa oświatowego. Twoje pytanie dotyczy innej dziedziny prawa i wykracza poza ten zakres. Nie mogę udzielić informacji na ten temat."
 
     prompt_syntezy = PROMPT_SYNTEZA_ODPOWIEDZI.format(
         analiza_prawna=request.analiza_prawna or "Brak danych.",
