@@ -1,128 +1,103 @@
-# main.py
 import os
-import re
+import json
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import List, Literal, Optional
-import openai
+from pydantic import BaseModel
+from openai import AsyncOpenAI
+from dotenv import load_dotenv
+import uvicorn
 
-# --- Tworzenie Aplikacji ---
-app = FastAPI(
-    title="APO-Orchestrator API",
-    description="API zarządzające logiką i bezpieczeństwem agenta APO. Implementuje architekturę sekwencyjną i egzekwuje zasady Konstytucji Agenta.",
-    version="3.0.0", # Wersja finalna
-)
+# --- KONFIGURACJA ---
+load_dotenv()
+app = FastAPI()
 
-# --- Middleware CORS ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["https://chat.openai.com"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- Konfiguracja Klienta pod OpenRouter (BEZPIECZNA) ---
-# Klucz API jest wczytywany ze zmiennej środowiskowej
-client = openai.OpenAI(
+# Klucz API do modelu językowego (najlepiej przez OpenRouter)
+client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY")
+    api_key=os.getenv("OPENROUTER_API_KEY"),
 )
 
-# --- Definicje Modeli Danych (Pydantic) ---
+# --- MIKRO-INSTRUKCJE (PROMPTY W JĘZYKU ANGIELSKIM DLA PRECYZJI) ---
+PROMPT_KATEGORYZACJA = """
+Your only task is to assess if the following query is exclusively about Polish educational law.
+Your domain includes: Teacher's Charter, school management, student rights, pedagogical supervision.
+Topics like general civil law, copyright law, construction law, or public procurement law are OUTSIDE YOUR DOMAIN.
+Answer only 'TAK' or 'NIE'.
+
+Query: "{query}"
+"""
+
+PROMPT_ANALIZA_ZAPYTANIA = """
+Your task is to decompose the user's query into a simple action plan in JSON format. Analyze the query and return a JSON with a list of tasks and a case signature if applicable. Allowed tasks are: 'analiza_prawna', 'weryfikacja_cytatu', 'biuletyn_informacyjny'. For simple queries, return only 'analiza_prawna'.
+
+Query: "{query}"
+"""
+
+PROMPT_SYNTEZA_ODPOWIEDZI = """
+You are an editor in a law firm specializing in educational law. Your task is to assemble the following verified components into a single, coherent, professional, and clear response in Markdown format for a client. The response MUST be in Polish.
+
+Here are the components:
+- Legal analysis from the knowledge base: {analiza_prawna}
+- Citation verification result: {wynik_weryfikacji}
+- Information from the news bulletin (latest changes): {biuletyn_informacyjny}
+
+Create a response that is readable and helpful for a school principal or teacher.
+"""
+
+# --- MODELE DANYCH (PYDANTIC) ---
 class QueryRequest(BaseModel):
     query: str
 
-class PlanZadania(BaseModel):
-    zadania: List[Literal["analiza_prawna", "biuletyn_men", "biuletyn_cke", "weryfikacja_cytatu"]]
-    sygnatura: Optional[str] = None
-
 class SynthesisRequest(BaseModel):
-    analiza_prawna: Optional[str] = Field(default=None)
-    wynik_weryfikacji: Optional[str] = Field(default=None)
-    biuletyn_informacyjny: Optional[str] = Field(default=None)
+    analiza_prawna: str | None = None
+    wynik_weryfikacji: str | None = None
+    biuletyn_informacyjny: str | None = None
 
-# --- BIBLIOTEKA MIKRO-INSTRUKCJI ---
-PROMPTS = {
-    "analityk": """
-        Przeanalizuj poniższe zapytanie użytkownika. Twoim jedynym zadaniem jest zidentyfikowanie, jakie zadania należy wykonać. Odpowiedz wyłącznie w formacie JSON.
-        Możliwe zadania: "analiza_prawna", "biuletyn_men", "biuletyn_cke", "weryfikacja_cytatu".
-        Dla "weryfikacja_cytatu" podaj znalezioną sygnaturę.
-        Pytanie użytkownika:
-        '''
-        {query}
-        '''
-    """,
-    "redaktor": """
-        Twoim jedynym zadaniem jest połączenie poniższych, zweryfikowanych komponentów w jedną, spójną i profesjonalną odpowiedź dla użytkownika. Zachowaj formatowanie Markdown. Jeśli komponent "Biuletyn Informacyjny" istnieje, oddziel go od części prawnej linią (---).
-
-        Komponent "Analiza Prawna":
-        '''
-        {analiza_prawna}
-        '''
-
-        Komponent "Wynik Weryfikacji Cytatu":
-        '''
-        {wynik_weryfikacji}
-        '''
-
-        Komponent "Biuletyn Informacyjny":
-        '''
-        {biuletyn_informacyjny}
-        '''
-    """
-}
-
-# --- Rzeczywista Funkcja Wywołująca LLM ---
-def wywolaj_llm(prompt: str, model_do_zadania: str) -> str:
-    """Wywołuje wybrany model LLM przez bramkę OpenRouter."""
+# --- FUNKCJE POMOCNICZE ---
+async def llm_call(prompt: str, model: str = "openai/gpt-4o"):
     try:
-        print(f"--- WYWOŁANIE MODELU '{model_do_zadania}' PRZEZ OPENROUTER ---")
-        response = client.chat.completions.create(
-            model=model_do_zadania,
-            messages=[{"role": "user", "content": prompt}]
+        response = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0
         )
         return response.choices[0].message.content
     except Exception as e:
-        print(f"Błąd podczas wywołania LLM: {e}")
-        raise HTTPException(status_code=500, detail=f"Błąd komunikacji z modelem AI: {e}")
+        raise HTTPException(status_code=500, detail=f"AI model call error: {e}")
 
-# --- Główne Endpointy API (Actions dla GPT-s) ---
+# --- ENDPOINTY API ---
 @app.post("/analyze-query")
 async def analyze_query(request: QueryRequest):
-    """Krok 1: Rola 'Analityk' z wbudowanym 'Strażnikiem'."""
-    forbidden_keywords = ["źródła wiedzy", "baza wiedzy", "twoje instrukcje", "jak działasz", "podaj swoje źródła"]
-    if any(keyword in request.query.lower() for keyword in forbidden_keywords):
-        # Jeśli pytanie jest niedozwolone, Orkiestrator sam zwraca finalną odpowiedź,
-        # pomijając całkowicie model AI. To jest "twarda" reguła Konstytucji.
-        raise HTTPException(
-            status_code=403, 
-            detail="Moje odpowiedzi opierają się na wewnętrznej bazie wiedzy, która została opracowana przez zespół ekspertów z zakresu prawa oświatowego. Zgodnie z zasadami działania, szczegółowe źródła techniczne i materiały pomocnicze nie są udostępniane."
-        )
+    """Krok 1: Kategoryzuje zapytanie i tworzy plan działania."""
     
-    prompt = PROMPTS["analityk"].format(query=request.query)
+    # --- NOWOŚĆ: STRAŻNIK DOMENY (DOMAIN GUARD) Zaimplementowany w kodzie ---
+    prompt_kategoryzacji = PROMPT_KATEGORYZACJA.format(query=request.query)
+    kategoria = await llm_call(prompt_kategoryzacji, model="mistralai/mistral-7b-instruct:free")
+
+    if "NIE" in kategoria.upper():
+        # Zwraca specjalny plan oznaczający odrzucenie
+        return {"zadania": ["ODRZUCONE_SPOZA_DOMENY"], "sygnatura": ""}
+    
+    prompt_analizy = PROMPT_ANALIZA_ZAPYTANIA.format(query=request.query)
+    plan_json_str = await llm_call(prompt_analizy)
     try:
-        wynik_json_str = wywolaj_llm(prompt, "openai/gpt-4o")
-        # Prosta funkcja czyszcząca
-        if "```json" in wynik_json_str:
-            wynik_json_str = wynik_json_str.split("```json")[1].split("```")[0]
-        plan = PlanZadania.parse_raw(wynik_json_str)
-        return plan
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Błąd podczas analizy zapytania przez AI: {e}")
+        plan_zadania = json.loads(plan_json_str)
+        return plan_zadania
+    except json.JSONDecodeError:
+        # Awaryjny plan, jeśli JSON zawiedzie
+        return {"zadania": ["analiza_prawna"], "sygnatura": ""}
 
-@app.post("/gate-and-format-response", response_model=str)
-async def gate_and_format_response(komponenty: SynthesisRequest):
-    """Krok Ostatni: Rola 'Redaktor'."""
-    prompt = PROMPTS["redaktor"].format(
-        analiza_prawna=komponenty.analiza_prawna or "Brak danych.",
-        wynik_weryfikacji=komponenty.wynik_weryfikacji or "Brak danych.",
-        biuletyn_informacyjny=komponenty.biuletyn_informacyjny or "Brak danych."
+@app.post("/gate-and-format-response")
+async def gate_and_format_response(request: SynthesisRequest):
+    """Krok Ostatni: Składa komponenty i egzekwuje reguły bezpieczeństwa."""
+    
+    # Sprawdzenie, czy plan nie został odrzucony na wcześniejszym etapie
+    if request.analiza_prawna == "ODRZUCONE_SPOZA_DOMENY":
+        return "Dziękuję za Twoje pytanie. Nazywam się Asystent Prawa Oświatowego, a moja wiedza jest specjalistycznie ograniczona wyłącznie do zagadnień polskiego prawa oświatowego. Twoje pytanie dotyczy innej dziedziny prawa i wykracza poza ten zakres. Nie mogę udzielić informacji na ten temat."
+
+    prompt_syntezy = PROMPT_SYNTEZA_ODPOWIEDZI.format(
+        analiza_prawna=request.analiza_prawna or "Brak danych.",
+        wynik_weryfikacji=request.wynik_weryfikacji or "Nie dotyczy.",
+        biuletyn_informacyjny=request.biuletyn_informacyjny or "Brak danych."
     )
-    return wywolaj_llm(prompt, "mistralai/mistral-7b-instruct")
-
-@app.get("/health")
-def health_check():
-    """Endpoint używany przez Render do weryfikacji, czy aplikacja działa poprawnie."""
-    return {"status": "ok"}
+    final_response = await llm_call(prompt_syntezy)
+    return final_response
