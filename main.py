@@ -10,14 +10,32 @@ import uvicorn
 load_dotenv()
 app = FastAPI()
 
-# Klucz API do modelu językowego (najlepiej przez OpenRouter)
-client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-)
+# --- ZMIANA ARCHITEKTONICZNA: Leniwa Inicjalizacja Klienta AI ---
+# Klient nie jest już tworzony globalnie przy starcie aplikacji.
+# Zostanie utworzony przy pierwszym wywołaniu funkcji, która go potrzebuje.
+_client = None
 
-# --- MIKRO-INSTRUKCJE (PROMPTY W JĘZYKU ANGIELSKIM DLA PRECYZJI) ---
-# ... (sekcja z promptami pozostaje bez zmian) ...
+def get_client():
+    """
+    Funkcja tworzy klienta AI przy pierwszym użyciu (leniwa inicjalizacja).
+    Gwarantuje to, że zmienne środowiskowe są już załadowane.
+    """
+    global _client
+    if _client is None:
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            # Ta wiadomość pojawi się w logach Render, jeśli klucz nie zostanie znaleziony
+            print("KRYTYCZNY BŁĄD: Zmienna środowiskowa OPENROUTER_API_KEY nie jest ustawiona lub jest pusta!")
+            raise ValueError("API key for OpenRouter is not configured.")
+        
+        _client = AsyncOpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+        )
+    return _client
+
+# --- MIKRO-INSTRUKCJE (PROMPTY) ---
+# ... (ta sekcja pozostaje bez zmian) ...
 PROMPT_KATEGORYZACJA = """
 Your only task is to assess if the following query is exclusively about Polish educational law. Your domain includes: Teacher's Charter, school management, student rights, pedagogical supervision. Topics like general civil law, copyright law, construction law, or public procurement law are OUTSIDE YOUR DOMAIN. Answer only 'TAK' or 'NIE'.
 Query: "{query}"
@@ -47,6 +65,8 @@ class SynthesisRequest(BaseModel):
 # --- FUNKCJE POMOCNICZE ---
 async def llm_call(prompt: str, model: str = "openai/gpt-4o"):
     try:
+        # Używamy funkcji get_client() zamiast globalnego obiektu client
+        client = get_client()
         response = await client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
@@ -54,27 +74,22 @@ async def llm_call(prompt: str, model: str = "openai/gpt-4o"):
         )
         return response.choices[0].message.content
     except Exception as e:
+        # Ten błąd będzie teraz widoczny w logach, jeśli wystąpi
+        print(f"Błąd podczas wywołania LLM: {e}")
         raise HTTPException(status_code=500, detail=f"AI model call error: {e}")
 
 # --- ENDPOINTY API ---
 @app.get("/health")
 def health_check():
-    """Ten endpoint jest używany przez Render do sprawdzania, czy aplikacja działa."""
     return {"status": "ok"}
-
-# --- DODATKOWY ENDPOINT TESTOWY ---
-@app.get("/test-endpoint")
-def test_endpoint():
-    """Ten endpoint służy do ostatecznej weryfikacji, czy nowy kod jest wdrażany."""
-    return {"message": "Test endpoint is working!"}
 
 @app.post("/analyze-query")
 async def analyze_query(request: QueryRequest):
-    # ... (reszta funkcji bez zmian) ...
     prompt_kategoryzacji = PROMPT_KATEGORYZACJA.format(query=request.query)
     kategoria = await llm_call(prompt_kategoryzacji, model="mistralai/mistral-7b-instruct:free")
     if "NIE" in kategoria.upper():
         return {"zadania": ["ODRZUCONE_SPOZA_DOMENY"], "sygnatura": ""}
+    
     prompt_analizy = PROMPT_ANALIZA_ZAPYTANIA.format(query=request.query)
     plan_json_str = await llm_call(prompt_analizy)
     try:
@@ -85,9 +100,9 @@ async def analyze_query(request: QueryRequest):
 
 @app.post("/gate-and-format-response")
 async def gate_and_format_response(request: SynthesisRequest):
-    # ... (reszta funkcji bez zmian) ...
     if request.analiza_prawna == "ODRZUCONE_SPOZA_DOMENY":
         return "Dziękuję za Twoje pytanie. Nazywam się Asystent Prawa Oświatowego, a moja wiedza jest specjalistycznie ograniczona wyłącznie do zagadnienie polskiego prawa oświatowego. Twoje pytanie dotyczy innej dziedziny prawa i wykracza poza ten zakres. Nie mogę udzielić informacji na ten temat."
+
     prompt_syntezy = PROMPT_SYNTEZA_ODPOWIEDZI.format(
         analiza_prawna=request.analiza_prawna or "Brak danych.",
         wynik_weryfikacji=request.wynik_weryfikacji or "Nie dotyczy.",
