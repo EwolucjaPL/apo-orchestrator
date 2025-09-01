@@ -5,7 +5,7 @@ import asyncio
 from collections import Counter
 from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -14,7 +14,7 @@ from openai import AsyncOpenAI
 # KONFIGURACJA
 # --------------------------------------------------------------------------------------
 load_dotenv()
-app = FastAPI(title="APO Gateway", description="Gateway + mini‑RAG dla prawa oświatowego")
+app = FastAPI(title="APO Gateway", description="Gateway + mini-RAG dla prawa oświatowego")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 if not OPENROUTER_API_KEY:
@@ -57,7 +57,8 @@ PROMPT_SYNTEZA_ODPOWIEDZI = (
     "[Analiza prawna]\n{analiza_prawna}\n\n"
     "[Wynik weryfikacji cytatu]\n{wynik_weryfikacji}\n\n"
     "[Biuletyn informacji – najnowsze zmiany]\n{biuletyn_informacyjny}\n\n"
-    "Wymagania: bądź zwięzły, rzeczowy, wskaż podstawy prawne, wypunktuj zalecenia dyrektora/nauczyciela."
+    "Wymagania: bądź zwięzły, rzeczowy, wskaż podstawy prawne, wypunktuj zalecenia dyrektora/nauczyciela. "
+    "Nie używaj bloków kodu ani potrójnych backticków; zwracaj czysty Markdown (nagłówki, listy, pogrubienia)."
 )
 
 # --------------------------------------------------------------------------------------
@@ -83,22 +84,19 @@ class SearchHit(BaseModel):
     snippet: str
 
 # --------------------------------------------------------------------------------------
-# MINI‑RAG: Ładowanie indeksu i proste wyszukiwanie słów kluczowych
+# MINI-RAG: Ładowanie indeksu i proste wyszukiwanie słów kluczowych
 # --------------------------------------------------------------------------------------
 IndexEntry = Dict[str, Any]
 _INDEX_METADATA: Dict[str, Any] = {}
 _ENTRIES: List[IndexEntry] = []
 
-
 def _normalize_text(t: str) -> str:
     return re.sub(r"\s+", " ", t.lower()).strip()
-
 
 def _tokenize(t: str) -> List[str]:
     t = _normalize_text(t)
     t = re.sub(r"[^\wąćęłńóśźż\s]", " ", t)
     return [tok for tok in t.split() if len(tok) > 2]
-
 
 def _load_index(path: str) -> None:
     global _INDEX_METADATA, _ENTRIES
@@ -108,17 +106,12 @@ def _load_index(path: str) -> None:
         data = json.load(f)
     _INDEX_METADATA = data.get("metadata", {})
     _ENTRIES = data.get("entries", [])
-    # wstępna normalizacja dla szybszego wyszukiwania
     for e in _ENTRIES:
         e["_title_norm"] = _normalize_text(e.get("title", ""))
         e["_summary_norm"] = _normalize_text(e.get("summary", ""))
         e["_tokens"] = _tokenize(e.get("title", "") + " " + e.get("summary", ""))
 
-
 _load_index(KNOWLEDGE_INDEX_PATH)
-
-
-# Bardzo prosty ranking: TF (częstość tokenów zapytania) + bonus za dopasowanie frazy w tytule
 
 def _score_entry(query_tokens: List[str], entry: IndexEntry) -> float:
     if not query_tokens:
@@ -130,7 +123,6 @@ def _score_entry(query_tokens: List[str], entry: IndexEntry) -> float:
     if q_join and q_join in title:
         score += 2.0
     return float(score)
-
 
 def search_entries(query: str, k: int = 5) -> List[SearchHit]:
     q_tokens = _tokenize(query)
@@ -156,7 +148,6 @@ def search_entries(query: str, k: int = 5) -> List[SearchHit]:
         )
     return hits
 
-
 # --------------------------------------------------------------------------------------
 # NARZĘDZIA: wywołania LLM z twardymi zasadami
 # --------------------------------------------------------------------------------------
@@ -177,16 +168,14 @@ async def llm_call(prompt: str, model: str = LLM_DEFAULT_MODEL, timeout: float =
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Błąd wywołania modelu AI: {e}")
 
-
 def sanitize_component(text: Optional[str]) -> str:
     if not text:
         return ""
-    # usuwamy potencjalne próby sterowania modelem
+    # usuń potencjalne instrukcje sterujące
     text = re.sub(r"```.*?```", " ", text, flags=re.S)
-    text = re.sub(r"(^|\n)\s*#{1,6}.*", " ", text)  # nagłówki
+    text = re.sub(r"(^|\n)\s*#{1,6}.*", " ", text)
     text = text.replace("<|system|>", "").replace("<|assistant|>", "").replace("<|user|>", "")
     return text.strip()
-
 
 # --------------------------------------------------------------------------------------
 # ENDPOINTY API
@@ -199,21 +188,19 @@ def health_check() -> Dict[str, Any]:
         "kb_version": _INDEX_METADATA.get("version"),
     }
 
-
 @app.post("/analyze-query")
 async def analyze_query(request: QueryRequest) -> Dict[str, Any]:
-    # 1) Kategoryzacja (TAK/NIE – twarde porównanie)
+    # 1) Kategoryzacja domeny
     k_prompt = PROMPT_KATEGORYZACJA.format(query=request.query)
     k_raw = (await llm_call(k_prompt, model=LLM_PLANNER_MODEL)).strip().upper()
     k_value = "TAK" if k_raw == "TAK" else ("NIE" if k_raw == "NIE" else "TAK")
     if k_value == "NIE":
         return {"zadania": ["ODRZUCONE_SPOZA_DOMENY"]}
 
-    # 2) Plan zadań (wymuszony JSON + walidacja)
+    # 2) Plan zadań (JSON + walidacja)
     p_prompt = PROMPT_ANALIZA_ZAPYTANIA.format(query=request.query)
     p_raw = await llm_call(p_prompt, model=LLM_PLANNER_MODEL)
 
-    # wyłuskanie pierwszego poprawnego bloku JSON
     m = re.search(r"\{[\s\S]*\}", p_raw)
     plan_json = m.group(0) if m else '{"zadania":["analiza_prawna"]}'
     try:
@@ -223,20 +210,20 @@ async def analyze_query(request: QueryRequest) -> Dict[str, Any]:
 
     return plan.model_dump()
 
-
 @app.get("/knowledge/search", response_model=List[SearchHit])
 async def knowledge_search(q: str = Query(..., min_length=2), k: int = Query(MAX_RETURN_SNIPPETS, ge=1, le=10)):
     return search_entries(q, k=k)
 
-
 @app.post("/gate-and-format-response")
-async def gate_and_format_response(request: SynthesisRequest) -> str:
+async def gate_and_format_response(request: SynthesisRequest):
+    # sentinel — poza domeną
     if request.analiza_prawna == "ODRZUCONE_SPOZA_DOMENY":
-        return (
+        final_md = (
             "Dziękuję za Twoje pytanie. Nazywam się Asystent Prawa Oświatowego, a moja wiedza "
             "jest ograniczona wyłącznie do zagadnień polskiego prawa oświatowego. Twoje pytanie "
             "wykracza poza ten zakres – nie mogę udzielić informacji na ten temat."
         )
+        return Response(content=final_md, media_type="text/markdown; charset=utf-8")
 
     analiza = sanitize_component(request.analiza_prawna)
     wery = sanitize_component(request.wynik_weryfikacji)
@@ -247,13 +234,12 @@ async def gate_and_format_response(request: SynthesisRequest) -> str:
         wynik_weryfikacji=wery or "(brak danych)",
         biuletyn_informacyjny=biul or "(brak danych)",
     )
-    return await llm_call(prompt, model=LLM_DEFAULT_MODEL)
-
+    final_md = await llm_call(prompt, model=LLM_DEFAULT_MODEL)
+    return Response(content=final_md, media_type="text/markdown; charset=utf-8")
 
 # --------------------------------------------------------------------------------------
 # DEV ENTRYPOINT
 # --------------------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
