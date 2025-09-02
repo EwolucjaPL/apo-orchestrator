@@ -54,6 +54,11 @@ MAX_RETURN_SNIPPETS = int(os.getenv("MAX_RETURN_SNIPPETS", "5"))
 MAX_QUERY_CHARS = int(os.getenv("MAX_QUERY_CHARS", "2000"))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "2097152"))  # 2 MB
 ALLOW_UPLOADS = os.getenv("ALLOW_UPLOADS", "false").lower() == "true"
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "120"))
+
+# NOWE: Domyślna data stanu prawnego dla sekcji "Podstawa prawna"
+LEGAL_STATUS_DEFAULT_DATE = os.getenv("LEGAL_STATUS_DEFAULT_DATE", "1 września 2025 r.")
 
 # CORS i kompresja
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
@@ -72,8 +77,6 @@ if _PROXY_HEADERS_AVAILABLE:
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 # Prosty rate-limit per IP (in-memory; dla 1 procesu)
-RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
-RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "120"))
 _RATE_LOG: Dict[str, List[float]] = {}
 
 _client: Optional[AsyncOpenAI] = None
@@ -154,43 +157,38 @@ PROMPT_ANALIZA_ZAPYTANIA = (
     "Respond ONLY with valid JSON, no explanations.\n\nQuery: \"{query}\""
 )
 
-# --- NOWY SCHEMAT ODPOWIEDZI (9 SEKCJI) ---
+# --- NOWY, CZYTELNY SCHEMAT 9-SEKCYJNEJ ODPOWIEDZI ---
 PROMPT_SYNTEZA_ODPOWIEDZI = (
     "You are Asystent Prawa Oświatowego. Assemble the verified components into a single, "
-    "coherent, professional, and clear response in Markdown in Polish. "
-    "FOLLOW EXACTLY THE SCHEMA BELOW (all 9 sections, in order). "
-    "Do not skip any section. If a component is missing, write (brak danych). "
-    "Do not use code blocks or backticks. Use the exact emoji and section names. "
-    "Keep the language clear, practical, and concise.\n\n"
-    "📑 Schemat odpowiedzi APO – nowa wersja\n"
-    "1. **Weryfikacja pytania**\n"
-    "- Krótkie parafrazowanie pytania użytkownika.\n\n"
-    "2. **Komunikat weryfikacji**\n"
-    "- ✅ Jednozdaniowe potwierdzenie, czego dotyczy odpowiedź.\n\n"
-    "3. **Podstawa prawna ⚖️**\n"
-    "- Lista punktowana: artykuły, ustawy, akty wykonawcze.\n"
-    "- Dodaj „Stan prawny: [data]”.\n\n"
-    "4. **Interpretacja prawna 💡**\n"
-    "- 2–3 akapity wyjaśnienia prostym językiem (warunki, wyjątki, kto decyduje).\n\n"
-    "5. **Procedura krok po kroku 📝**\n"
-    "- Lista numerowana (1., 2., 3.), maksymalnie 5–7 kroków.\n\n"
-    "6. **Odpowiedź wprost 🎯**\n"
-    "- Jedno zdanie: Tak/Nie + kluczowy warunek.\n\n"
-    "7. **Proaktywna sugestia 💡**\n"
-    "- 2–3 praktyczne wskazówki (opcjonalnie wzmianka o wzorach dokumentów).\n\n"
-    "8. **Disclaimer prawny ⚖️**\n"
-    "- Standardowa formuła: odpowiedź ogólna, nie stanowi porady prawnej; podaj stan prawny.\n\n"
-    "9. **Dodatkowa oferta wsparcia 🤝**\n"
-    "- Pytanie otwierające, zachęcające do dalszej interakcji.\n\n"
+    "coherent, professional, and crystal-clear answer in Polish for school leaders. "
+    "Use exactly nine sections shown below, in order. Keep it concise and practical. "
+    "Never include meta-notes or code blocks; do not reveal internal IDs.\n\n"
+    "SEKCJE (WYMAGANE, W TEJ KOLEJNOŚCI):\n"
+    "1) **Weryfikacja pytania** – jedno zdanie parafrazy pytania użytkownika.\n"
+    "2) **Komunikat weryfikacji** – linia zaczynająca się od ✅ i krótkie potwierdzenie zakresu odpowiedzi.\n"
+    "3) **Podstawa prawna ⚖️** – lista punktowana artykułów/aktów, zawsze zakończ:\n"
+    "   Stan prawny: [data] (jeśli brak danych w komponentach, wpisz: {stan_prawny_domyslny} (domyślny)).\n"
+    "4) **Interpretacja prawna 💡** – 2–3 krótkie akapity wyjaśniające sens i wyjątki, prostym językiem.\n"
+    "5) **Procedura krok po kroku 📝** – lista numerowana 1–5 (maks. 7), praktyczne kroki.\n"
+    "6) **Odpowiedź wprost 🎯** – JEDNO zdanie wytłuszczone: Tak/Nie + warunek.\n"
+    "7) **Proaktywna sugestia 💡** – 2–3 krótkie wskazówki (np. wzór pisma, komunikacja z interesariuszami).\n"
+    "8) **Disclaimer prawny ⚖️** – standard: odpowiedź ogólna, nie jest poradą prawną; podaj stan prawny.\n"
+    "9) **Dodatkowa oferta wsparcia 🤝** – pytanie otwierające do dalszego działania.\n\n"
+    "FORMATOWANIE (OBOWIĄZKOWE):\n"
+    "- Nie używaj nagłówków #, ##, ###! Sekcje pisz jako wytłuszczone tytuły (**) + tekst pod spodem.\n"
+    "- W **Podstawa prawna ⚖️**: użyj punktorów (–) z pełnymi nazwami aktów i artykułów (np. „Karta Nauczyciela, art. 20 ust. 1 pkt 2 (Dz.U. 2023 poz. 984)”).\n"
+    "- W **Procedura krok po kroku 📝**: numerowana lista 1., 2., 3.\n"
+    "- W **Odpowiedź wprost 🎯**: całe zdanie pogrubione.\n"
+    "- Na końcu dodaj **Źródła:** jako zwykłą listę punktowaną z pełnymi opisami (akty prawne, komentarze, dokumenty oficjalne). "
+    "Jeśli komponenty nie dostarczyły źródeł, wypisz tylko akty oczywiste z treści; nigdy nie pokazuj wewnętrznych identyfikatorów.\n\n"
     "== KOMPONENTY DO UŻYCIA ==\n"
     "[Analiza prawna]\n{analiza_prawna}\n\n"
     "[Wynik weryfikacji cytatu]\n{wynik_weryfikacji}\n\n"
     "[Biuletyn informacji – najnowsze zmiany]\n{biuletyn_informacyjny}\n\n"
-    "Wymagania formatowania:\n"
-    "- Nie używaj nagłówków (#, ##, ###); stosuj pogrubienia i listy.\n"
-    "- Zawsze dodaj sekcję **Źródła:** na końcu odpowiedzi (ID z bazy/akt Dz.U.).\n"
-    "- Gdy zadanie obejmuje weryfikację cytatu, wstaw 1–2 zdania LITERALNEGO cytatu przepisu z oznaczeniem (ustawa, art., ust., Dz.U.).\n"
-    "- Nie powołuj się na źródła inne niż dostarczone w komponentach; nie używaj własnej pamięci modelu."
+    "WAŻNE ZASADY:\n"
+    "- Jeśli brak któregoś komponentu, wpisz (brak danych), ale nie wymyślaj treści.\n"
+    "- Nie używaj kodu, backticków, tabel ani odnośników do wewnętrznych ID.\n"
+    "- Pisz krótko, jasno, z myślą o dyrektorach szkół."
 )
 
 # --------------------------------------------------------------------------------------
@@ -256,7 +254,11 @@ def _build_bm25():
 def _load_index(path: str) -> None:
     global _INDEX_METADATA, _ENTRIES
     if not os.path.exists(path):
-        raise RuntimeError(f"Nie znaleziono indeksu wiedzy pod ścieżką: {path}")
+        # Zamiast crasha: startujemy z pustym indeksem (serwis wstaje)
+        _INDEX_METADATA = {"version": "empty"}
+        _ENTRIES = []
+        _build_bm25()
+        return
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if isinstance(data, dict):
@@ -306,7 +308,7 @@ def search_entries(query: str, k: int = 5) -> List[SearchHit]:
                 title=e.get("title", ""),
                 book=e.get("book"),
                 chapter=e.get("chapter"),
-                score=float(s),
+                score=float(s if isinstance(s, (int, float)) else s[0]),
                 snippet=snippet,
             )
         )
@@ -451,6 +453,7 @@ async def gate_and_format_response(request: SynthesisRequest):
         analiza_prawna=analiza or "(brak danych)",
         wynik_weryfikacji=wery or "(brak danych)",
         biuletyn_informacyjny=biul or "(brak danych)",
+        stan_prawny_domyslny=LEGAL_STATUS_DEFAULT_DATE,  # <-- wstrzyknięcie domyślnej daty
     )
     final_md = await llm_call(prompt, model=LLM_DEFAULT_MODEL)
     return Response(content=final_md, media_type="text/markdown; charset=utf-8")
