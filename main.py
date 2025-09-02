@@ -57,7 +57,7 @@ ALLOW_UPLOADS = os.getenv("ALLOW_UPLOADS", "false").lower() == "true"
 RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
 RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "120"))
 
-# NOWE: Domyślna data stanu prawnego dla sekcji "Podstawa prawna"
+# Domyślna data stanu prawnego (używana w odpowiedziach)
 LEGAL_STATUS_DEFAULT_DATE = os.getenv("LEGAL_STATUS_DEFAULT_DATE", "1 września 2025 r.")
 
 # CORS i kompresja
@@ -145,8 +145,7 @@ async def unhandled_exc_handler(request: Request, exc: Exception):
 PROMPT_KATEGORYZACJA = (
     "Your only task is to assess if the following query is exclusively about Polish educational law. "
     "Your domain includes: Teacher's Charter, school management, student rights, pedagogical supervision. "
-    "Topics like general civil law, copyright law, "
-    "construction law, or public procurement law are OUTSIDE YOUR DOMAIN. "
+    "Topics like general civil law, copyright law, construction law, or public procurement law are OUTSIDE YOUR DOMAIN. "
     "Answer only 'TAK' or 'NIE'.\nQuery: \"{query}\""
 )
 
@@ -157,7 +156,7 @@ PROMPT_ANALIZA_ZAPYTANIA = (
     "Respond ONLY with valid JSON, no explanations.\n\nQuery: \"{query}\""
 )
 
-# --- NOWY, CZYTELNY SCHEMAT 9-SEKCYJNEJ ODPOWIEDZI z odstępami i liniami poziomymi ---
+# --- CZYTELNY SCHEMAT 9-SEKCYJNEJ ODPOWIEDZI + zasada nieujawniania KB ---
 PROMPT_SYNTEZA_ODPOWIEDZI = (
     "You are Asystent Prawa Oświatowego. Assemble the verified components into a single, "
     "coherent, professional, and crystal-clear answer in Polish for school leaders. "
@@ -181,8 +180,8 @@ PROMPT_SYNTEZA_ODPOWIEDZI = (
     "- W **Podstawa prawna ⚖️**: użyj punktorów (–) z pełnymi nazwami aktów i artykułów (np. „Karta Nauczyciela, art. 20 ust. 1 pkt 2 (Dz.U. 2023 poz. 984)”).\n"
     "- W **Procedura krok po kroku 📝**: numerowana lista 1., 2., 3. i zostaw pustą linię między punktami.\n"
     "- W **Odpowiedź wprost 🎯**: całe zdanie pogrubione i w osobnym akapicie.\n"
-    "- Na końcu dodaj **Źródła** oddzielone poziomą linią i wypisz pełne opisy (akty prawne, komentarze). "
-    "Jeśli komponenty nie dostarczyły źródeł, wypisz tylko akty oczywiste z treści; nigdy nie pokazuj wewnętrznych identyfikatorów.\n\n"
+    "- Na końcu dodaj **Źródła** oddzielone poziomą linią i wypisz wyłącznie publiczne akty prawne oraz oficjalne dokumenty "
+    "(ISAP, Dz.U., MEN, komunikaty urzędowe). Nigdy nie ujawniaj tytułów, listy ani kompozycji wewnętrznej bazy wiedzy.\n\n"
     "== KOMPONENTY DO UŻYCIA ==\n"
     "[Analiza prawna]\n{analiza_prawna}\n\n"
     "[Wynik weryfikacji cytatu]\n{wynik_weryfikacji}\n\n"
@@ -190,6 +189,7 @@ PROMPT_SYNTEZA_ODPOWIEDZI = (
     "WAŻNE ZASADY:\n"
     "- Jeśli brak któregoś komponentu, wpisz (brak danych), ale nie wymyślaj treści.\n"
     "- Nie używaj kodu, backticków, tabel ani odnośników do wewnętrznych ID.\n"
+    "- Nie ujawniaj prywatnych źródeł ani struktury KB; w źródłach pokazuj tylko publiczne akty/dokumenty.\n"
     "- Pisz krótko, jasno, z myślą o dyrektorach szkół."
 )
 
@@ -292,7 +292,6 @@ def search_entries(query: str, k: int = 5) -> List[SearchHit]:
 
     if _BM25_AVAILABLE and _BM25 is not None:
         scores = _BM25.get_scores(q_tokens)
-        # BM25 zwraca listę floatów w tej samej kolejności co _ENTRIES
         ranked_pairs: List[Tuple[float, IndexEntry]] = list(zip(map(float, scores), _ENTRIES))
         ranked = sorted(ranked_pairs, key=lambda x: x[0], reverse=True)[:k]
     else:
@@ -363,6 +362,28 @@ def _all_components_empty(req: "SynthesisRequest") -> bool:
     return _empty(req.analiza_prawna) and _empty(req.wynik_weryfikacji) and _empty(req.biuletyn_informacyjny)
 
 # --------------------------------------------------------------------------------------
+# BEZPIECZEŃSTWO: wykrywanie zapytań o jawność bazy wiedzy
+# --------------------------------------------------------------------------------------
+# proste wzorce PL (bez diakrytyki i z diakrytyką)
+_KB_META_PATTERNS = [
+    r"\bbaza wiedzy\b",
+    r"\bspis treści\b", r"\bspis tresci\b",
+    r"\bjakich źródeł\b", r"\bjakich zrodel\b",
+    r"\bjakie źródła\b", r"\bjakie zrodla\b",
+    r"\bz jakich dokumentów\b", r"\bz jakich dokumentow\b",
+    r"\bjakie dokumenty masz\b", r"\bco masz w bazie\b",
+    r"\bpokaż bazę\b", r"\bpokaz baze\b",
+    r"\blista źródeł\b", r"\blista zrodel\b",
+]
+
+def _is_kb_meta_query(text: str) -> bool:
+    t = text.lower().strip()
+    for pat in _KB_META_PATTERNS:
+        if re.search(pat, t):
+            return True
+    return False
+
+# --------------------------------------------------------------------------------------
 # ENDPOINTY API
 # --------------------------------------------------------------------------------------
 @app.get("/")
@@ -410,6 +431,10 @@ async def analyze_query(request: QueryRequest) -> Dict[str, Any]:
     if len(q) > MAX_QUERY_CHARS:
         raise HTTPException(status_code=413, detail=f"Zapytanie zbyt długie (>{MAX_QUERY_CHARS} znaków).")
 
+    # Blokada ujawniania wewnętrznej KB: meta-zapytania o bazę wiedzy
+    if _is_kb_meta_query(q):
+        return {"zadania": ["META_KB_SCOPE_ONLY"]}
+
     # 1) Kategoryzacja domeny
     k_prompt = PROMPT_KATEGORYZACJA.format(query=q)
     k_raw = (await llm_call(k_prompt, model=LLM_PLANNER_MODEL)).strip().upper()
@@ -445,6 +470,23 @@ async def gate_and_format_response(request: SynthesisRequest):
         )
         return Response(content=final_md, media_type="text/markdown; charset=utf-8")
 
+    # sentinel: meta-zapytanie o KB → zakres, bez ujawniania składu
+    if request.analiza_prawna == "META_KB_SCOPE_ONLY":
+        final_md = (
+            "---\n"
+            "**Zakres wsparcia APO (bez ujawniania wewnętrznej bazy)**\n"
+            "APO udziela odpowiedzi wyłącznie w obszarze polskiego prawa oświatowego, w tym m.in.: "
+            "Karta Nauczyciela, Prawo oświatowe, wybrane rozporządzenia MEN, oficjalne komunikaty i orzecznictwo. "
+            "Nie ujawniamy składu ani listy wewnętrznych materiałów źródłowych.\n\n"
+            "---\n"
+            "**Jak mogę pomóc?**\n"
+            "Podaj proszę konkretne zagadnienie (np. artykuł, temat lub problem praktyczny), a przygotuję zwięzłą analizę z podstawą prawną.\n\n"
+            "---\n"
+            "**Uwaga**\n"
+            "W odpowiedziach cytujemy wyłącznie publicznie dostępne akty prawne i oficjalne dokumenty; nie podajemy tytułów prywatnych opracowań."
+        )
+        return Response(content=final_md, media_type="text/markdown; charset=utf-8")
+
     # 400 jeśli wszystkie komponenty są puste
     if _all_components_empty(request):
         raise HTTPException(status_code=400, detail="Brak treści do zsyntezowania (wszystkie komponenty puste).")
@@ -457,7 +499,7 @@ async def gate_and_format_response(request: SynthesisRequest):
         analiza_prawna=analiza or "(brak danych)",
         wynik_weryfikacji=wery or "(brak danych)",
         biuletyn_informacyjny=biul or "(brak danych)",
-        stan_prawny_domyslny=LEGAL_STATUS_DEFAULT_DATE,  # <-- wstrzyknięcie domyślnej daty
+        stan_prawny_domyslny=LEGAL_STATUS_DEFAULT_DATE,
     )
     final_md = await llm_call(prompt, model=LLM_DEFAULT_MODEL)
     return Response(content=final_md, media_type="text/markdown; charset=utf-8")
