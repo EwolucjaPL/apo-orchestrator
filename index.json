@@ -1,0 +1,15 @@
+{
+  "metadata": {
+    "version": "demo-2025-09-02",
+    "note": "Minimal KB index to allow service start; replace with your real export when ready."
+  },
+  "entries": [
+    {
+      "id": "kn-art-42-ust-3-demo",
+      "title": "Karta Nauczyciela — art. 42 ust. 3 (DEMO)",
+      "summary": "Przykładowy wpis demonstracyjny do uruchomienia serwisu. Zastąp realnymi danymi KB.",
+      "book": "Karta Nauczyciela",
+      "chapter": "Art. 42 ust. 3"
+    }
+  ]
+}
