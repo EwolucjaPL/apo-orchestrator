@@ -7,11 +7,14 @@ from time import monotonic
 from collections import Counter
 from typing import List, Optional, Dict, Any, Tuple
 
+from datetime import datetime, timezone
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Query, Response, Request, UploadFile, File
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
-# --- ProxyHeadersMiddleware z bezpiecznym fallbackiem ---
+# ProxyHeaders z ostrożnym fallbackiem (nie blokuj startu, gdy brak modułu)
 try:
     from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
     _PROXY_HEADERS_AVAILABLE = True
@@ -23,12 +26,12 @@ from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-# --- ORJSON (szybszy serializer) ---
+# ORJSON (szybsza serializacja) – fallback do JSONResponse, jeśli brak
 try:
     from fastapi.responses import ORJSONResponse
     _ORJSON = True
 except Exception:
-    ORJSONResponse = JSONResponse  # fallback bez orjson
+    ORJSONResponse = JSONResponse  # fallback
     _ORJSON = False
 
 # --------------------------------------------------------------------------------------
@@ -39,14 +42,13 @@ load_dotenv()
 APP_TITLE = "APO Gateway"
 APP_DESC = "Gateway + mini-RAG dla prawa oświatowego"
 
-# FastAPI z szybkim serializerem (jeśli dostępny)
 app = FastAPI(
     title=APP_TITLE,
     description=APP_DESC,
     default_response_class=ORJSONResponse if _ORJSON else JSONResponse,
 )
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+# ENV / domyślne
 LLM_DEFAULT_MODEL = os.getenv("LLM_DEFAULT_MODEL", "openai/gpt-4o")
 LLM_PLANNER_MODEL = os.getenv("LLM_PLANNER_MODEL", "mistralai/mistral-7b-instruct:free")
 KNOWLEDGE_INDEX_PATH = os.getenv("KNOWLEDGE_INDEX_PATH", "index.json")
@@ -56,11 +58,11 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", "2097152"))  # 2 MB
 ALLOW_UPLOADS = os.getenv("ALLOW_UPLOADS", "false").lower() == "true"
 RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
 RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "120"))
-
-# Domyślna data stanu prawnego (używana w odpowiedziach)
 LEGAL_STATUS_DEFAULT_DATE = os.getenv("LEGAL_STATUS_DEFAULT_DATE", "1 września 2025 r.")
+BULLETIN_PATH = os.getenv("BULLETIN_PATH", "/var/apo/bulletin.json")
+ADMIN_KEY = os.getenv("APO_ADMIN_KEY")
 
-# CORS i kompresja
+# CORS + kompresja
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 ALLOW_ORIGINS = CORS_ORIGINS if CORS_ORIGINS else ["*"]
 app.add_middleware(
@@ -71,18 +73,15 @@ app.add_middleware(
     allow_headers=["content-type", "authorization", "x-request-id"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=500)
-
-# Proxy headers (prawdziwe IP z X-Forwarded-For), tylko gdy dostępne
 if _PROXY_HEADERS_AVAILABLE:
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
-# Prosty rate-limit per IP (in-memory; dla 1 procesu)
+# Rate-limit per IP (in-memory; dla 1 procesu)
 _RATE_LOG: Dict[str, List[float]] = {}
 
 _client: Optional[AsyncOpenAI] = None
-
 def get_client() -> AsyncOpenAI:
-    """Lenient: brak klucza = 503 dopiero przy użyciu LLM (nie przy starcie)."""
+    """Twórz klienta dopiero przy pierwszym użyciu; brak klucza = 503 przy wywołaniu."""
     global _client
     if _client is None:
         key = os.getenv("OPENROUTER_API_KEY")
@@ -94,12 +93,10 @@ def get_client() -> AsyncOpenAI:
 def _make_request_id() -> str:
     return str(uuid.uuid4())
 
-# Globalny middleware: X-Request-Id + rate-limit
+# Middleware: X-Request-Id + rate-limit
 @app.middleware("http")
 async def request_context(request: Request, call_next):
     rid = request.headers.get("X-Request-Id") or _make_request_id()
-
-    # proste ograniczenie: N żądań / 60s / IP
     if RATE_LIMIT_ENABLED:
         ip = request.client.host if request.client else "unknown"
         now = monotonic()
@@ -107,19 +104,19 @@ async def request_context(request: Request, call_next):
         cutoff = now - 60
         while bucket and bucket[0] < cutoff:
             bucket.pop(0)
-        if len(bucket) >= RATE_LIMIT_RPM and request.url.path not in ("/health", "/live", "/ready", "/"):
+        # /health, /ready, /live i / to białe listy
+        if len(bucket) >= RATE_LIMIT_RPM and request.url.path not in ("/health", "/ready", "/live", "/"):
             return ORJSONResponse(
                 {"detail": "Rate limit exceeded. Try again later."},
                 status_code=429,
                 headers={"Retry-After": "30", "X-Request-Id": rid},
             )
         bucket.append(now)
-
     resp = await call_next(request)
     resp.headers["X-Request-Id"] = rid
     return resp
 
-# Dodatkowe nagłówki bezpieczeństwa
+# Bezpieczne nagłówki
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     resp = await call_next(request)
@@ -128,7 +125,7 @@ async def security_headers(request: Request, call_next):
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
     return resp
 
-# Handlery wyjątków z X-Request-Id
+# Handlery wyjątków
 @app.exception_handler(HTTPException)
 async def http_exc_handler(request: Request, exc: HTTPException):
     rid = request.headers.get("X-Request-Id") or _make_request_id()
@@ -156,45 +153,42 @@ PROMPT_ANALIZA_ZAPYTANIA = (
     "Respond ONLY with valid JSON, no explanations.\n\nQuery: \"{query}\""
 )
 
-# --- CZYTELNY SCHEMAT 9-SEKCYJNEJ ODPOWIEDZI + zasada nieujawniania KB ---
+# 9-sekcyjny format + zakaz ujawniania wewnętrznej KB + większe odstępy
 PROMPT_SYNTEZA_ODPOWIEDZI = (
     "You are Asystent Prawa Oświatowego. Assemble the verified components into a single, "
     "coherent, professional, and crystal-clear answer in Polish for school leaders. "
     "Use exactly nine sections shown below, in order. Keep it concise and practical. "
     "Never include meta-notes or code blocks; do not reveal internal IDs.\n\n"
-    "SEKCJE (WYMAGANE, W TEJ KOLEJNOŚCI):\n"
+    "SEKCJE (W TEJ KOLEJNOŚCI):\n"
     "1) **Weryfikacja pytania** – jedno zdanie parafrazy pytania użytkownika.\n"
     "2) **Komunikat weryfikacji** – linia zaczynająca się od ✅ i krótkie potwierdzenie zakresu odpowiedzi.\n"
-    "3) **Podstawa prawna ⚖️** – lista punktowana artykułów/aktów, zawsze zakończ:\n"
+    "3) **Podstawa prawna ⚖️** – lista punktowana artykułów/aktów; zakończ wierszem:\n"
     "   Stan prawny: [data] (jeśli brak danych w komponentach, wpisz: {stan_prawny_domyslny} (domyślny)).\n"
-    "4) **Interpretacja prawna 💡** – 2–3 krótkie akapity wyjaśniające sens i wyjątki, prostym językiem.\n"
-    "5) **Procedura krok po kroku 📝** – lista numerowana 1–5 (maks. 7), praktyczne kroki.\n"
+    "4) **Interpretacja prawna 💡** – 2–3 krótkie akapity wyjaśniające sens i wyjątki.\n"
+    "5) **Procedura krok po kroku 📝** – lista numerowana 1–5 (max 7), praktyczne kroki.\n"
     "6) **Odpowiedź wprost 🎯** – JEDNO zdanie wytłuszczone: Tak/Nie + warunek.\n"
-    "7) **Proaktywna sugestia 💡** – 2–3 krótkie wskazówki (np. wzór pisma, komunikacja z interesariuszami).\n"
-    "8) **Disclaimer prawny ⚖️** – standard: odpowiedź ogólna, nie jest poradą prawną; podaj stan prawny.\n"
-    "9) **Dodatkowa oferta wsparcia 🤝** – pytanie otwierające do dalszego działania.\n\n"
+    "7) **Proaktywna sugestia 💡** – 2–3 krótkie wskazówki.\n"
+    "8) **Disclaimer prawny ⚖️** – standard: odpowiedź ogólna; podaj stan prawny.\n"
+    "9) **Dodatkowa oferta wsparcia 🤝** – pytanie otwierające.\n\n"
     "FORMATOWANIE (OBOWIĄZKOWE):\n"
     "- Przed KAŻDĄ sekcją wstaw poziomą linię: ---\n"
-    "- Dodaj DWIE puste linie między sekcjami (po treści sekcji zostaw dwie puste linie).\n"
-    "- Nie używaj nagłówków #, ##, ###! Sekcje pisz jako wytłuszczone tytuły (**) + tekst pod spodem.\n"
-    "- W **Podstawa prawna ⚖️**: użyj punktorów (–) z pełnymi nazwami aktów i artykułów (np. „Karta Nauczyciela, art. 20 ust. 1 pkt 2 (Dz.U. 2023 poz. 984)”).\n"
-    "- W **Procedura krok po kroku 📝**: numerowana lista 1., 2., 3. i zostaw pustą linię między punktami.\n"
-    "- W **Odpowiedź wprost 🎯**: całe zdanie pogrubione i w osobnym akapicie.\n"
-    "- Na końcu dodaj **Źródła** oddzielone poziomą linią i wypisz wyłącznie publiczne akty prawne oraz oficjalne dokumenty "
-    "(ISAP, Dz.U., MEN, komunikaty urzędowe). Nigdy nie ujawniaj tytułów, listy ani kompozycji wewnętrznej bazy wiedzy.\n\n"
-    "== KOMPONENTY DO UŻYCIA ==\n"
+    "- Dodaj DWIE puste linie między sekcjami (po treści sekcji zostaw dwie puste linie), aby poprawić czytelność.\n"
+    "- Nie używaj nagłówków #/##/###; sekcje pisz jako wytłuszczone tytuły (**) + tekst pod spodem.\n"
+    "- W **Podstawa prawna ⚖️** użyj punktorów (–) z pełnymi nazwami aktów i artykułów.\n"
+    "- W **Odpowiedź wprost 🎯**: całe zdanie wytłuszczone i w osobnym akapicie.\n"
+    "- Na końcu dodaj blok **Źródła** oddzielony poziomą linią i wypisz wyłącznie publiczne akty/dokumenty "
+    "(ISAP, Dz.U., MEN, komunikaty urzędowe). Nigdy nie ujawniaj tytułów ani kompozycji wewnętrznej bazy wiedzy.\n\n"
+    "== KOMPONENTY ==\n"
     "[Analiza prawna]\n{analiza_prawna}\n\n"
     "[Wynik weryfikacji cytatu]\n{wynik_weryfikacji}\n\n"
     "[Biuletyn informacji – najnowsze zmiany]\n{biuletyn_informacyjny}\n\n"
-    "WAŻNE ZASADY:\n"
-    "- Jeśli brak któregoś komponentu, wpisz (brak danych), ale nie wymyślaj treści.\n"
-    "- Nie używaj kodu, backticków, tabel ani odnośników do wewnętrznych ID.\n"
-    "- Nie ujawniaj prywatnych źródeł ani struktury KB; w źródłach pokazuj tylko publiczne akty/dokumenty.\n"
-    "- Pisz krótko, jasno, z myślą o dyrektorach szkół."
+    "ZASADY:\n"
+    "- Jeśli brak któregoś komponentu, wpisz (brak danych) – nie wymyślaj treści.\n"
+    "- Pisz krótko, jasno, zorientowanie na dyrektorów szkół.\n"
 )
 
 # --------------------------------------------------------------------------------------
-# MODELE DANYCH
+# MODELE
 # --------------------------------------------------------------------------------------
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=3, max_length=MAX_QUERY_CHARS)
@@ -216,12 +210,11 @@ class SearchHit(BaseModel):
     snippet: str
 
 # --------------------------------------------------------------------------------------
-# MINI-RAG (BM25 jeśli dostępny; w innym razie prosty TF)
+# MINI-RAG (opcjonalnie BM25)
 # --------------------------------------------------------------------------------------
 IndexEntry = Dict[str, Any]
 _INDEX_METADATA: Dict[str, Any] = {}
 _ENTRIES: List[IndexEntry] = []
-
 _BM25 = None
 try:
     from rank_bm25 import BM25Okapi  # type: ignore
@@ -254,9 +247,9 @@ def _build_bm25():
         _BM25 = BM25Okapi(corpus)
 
 def _load_index(path: str) -> None:
+    """Ładuj KB; jeśli brak pliku – startuj na pustym (serwis wstaje)."""
     global _INDEX_METADATA, _ENTRIES
     if not os.path.exists(path):
-        # Zamiast crasha: startujemy z pustym indeksem (serwis wstaje)
         _INDEX_METADATA = {"version": "empty"}
         _ENTRIES = []
         _build_bm25()
@@ -278,6 +271,7 @@ _load_index(KNOWLEDGE_INDEX_PATH)
 def _score_entry_tf(query_tokens: List[str], entry: IndexEntry) -> float:
     if not query_tokens:
         return 0.0
+    from collections import Counter
     cnt = Counter(entry.get("_tokens", []))
     score = sum(cnt[tok] for tok in query_tokens)
     title = entry.get("_title_norm", "")
@@ -318,7 +312,7 @@ def search_entries(query: str, k: int = 5) -> List[SearchHit]:
     return hits
 
 # --------------------------------------------------------------------------------------
-# WYWOŁANIA LLM (retry 1x)
+# LLM (z retry)
 # --------------------------------------------------------------------------------------
 async def llm_call(prompt: str, model: str = LLM_DEFAULT_MODEL, timeout: float = 30.0) -> str:
     async def _once() -> str:
@@ -330,7 +324,7 @@ async def llm_call(prompt: str, model: str = LLM_DEFAULT_MODEL, timeout: float =
         )
         return resp.choices[0].message.content
 
-    for i in range(2):  # 1 próba + 1 retry
+    for i in range(2):  # 1 retry
         try:
             return await asyncio.wait_for(_once(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -349,7 +343,6 @@ async def llm_call(prompt: str, model: str = LLM_DEFAULT_MODEL, timeout: float =
 def sanitize_component(text: Optional[str]) -> str:
     if not text:
         return ""
-    # usuń potencjalne instrukcje sterujące i nagłówki
     text = re.sub(r"```.*?```", " ", text, flags=re.S)
     text = re.sub(r"(^|\n)\s*#{1,6}.*", " ", text)
     text = text.replace("<|system|>", "").replace("<|assistant|>", "").replace("<|user|>", "")
@@ -362,9 +355,8 @@ def _all_components_empty(req: "SynthesisRequest") -> bool:
     return _empty(req.analiza_prawna) and _empty(req.wynik_weryfikacji) and _empty(req.biuletyn_informacyjny)
 
 # --------------------------------------------------------------------------------------
-# BEZPIECZEŃSTWO: wykrywanie zapytań o jawność bazy wiedzy
+# Polityka: nie ujawniamy składu KB (wykrywanie metapytania)
 # --------------------------------------------------------------------------------------
-# proste wzorce PL (bez diakrytyki i z diakrytyką)
 _KB_META_PATTERNS = [
     r"\bbaza wiedzy\b",
     r"\bspis treści\b", r"\bspis tresci\b",
@@ -375,7 +367,6 @@ _KB_META_PATTERNS = [
     r"\bpokaż bazę\b", r"\bpokaz baze\b",
     r"\blista źródeł\b", r"\blista zrodel\b",
 ]
-
 def _is_kb_meta_query(text: str) -> bool:
     t = text.lower().strip()
     for pat in _KB_META_PATTERNS:
@@ -384,7 +375,45 @@ def _is_kb_meta_query(text: str) -> bool:
     return False
 
 # --------------------------------------------------------------------------------------
-# ENDPOINTY API
+# BIULETYN: wczytywanie lokalnego feedu i endpoint do CRON-a
+# --------------------------------------------------------------------------------------
+def _load_bulletin_text() -> str:
+    p = Path(BULLETIN_PATH)
+    if not p.exists():
+        return ""
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        items = data.get("items", [])
+        if not items:
+            return ""
+        off = [i for i in items if i.get("source_type") == "official"]
+        unoff = [i for i in items if i.get("source_type") == "unofficial"]
+
+        lines: List[str] = []
+        if off:
+            lines.append("**Biuletyn (źródła oficjalne)**")
+            for it in off[:5]:
+                lines.append(f"- {it.get('title')} — {it.get('source')} ({it.get('date')})")
+            lines.append("")
+
+        if unoff:
+            lines.append("**Dodatkowe komentarze (źródła nieoficjalne)**")
+            for it in unoff[:3]:
+                lines.append(f"- {it.get('title')} — {it.get('source')} ({it.get('date')})")
+            lines.append("_Uwaga: pozycje z nieoficjalnych źródeł mają charakter informacyjny._")
+
+        return "\n".join(lines).strip()
+    except Exception:
+        return ""
+
+# Import aktualizatora źródeł (osobny plik public_sources.py)
+try:
+    from public_sources import refresh_all as refresh_all_sources  # zgodnie z Twoim modułem
+except Exception:
+    refresh_all_sources = None  # brak – endpoint zwróci 501
+
+# --------------------------------------------------------------------------------------
+# ENDPOINTY
 # --------------------------------------------------------------------------------------
 @app.get("/")
 def root():
@@ -406,7 +435,12 @@ def liveness() -> Dict[str, Any]:
 def readiness() -> Dict[str, Any]:
     kb_ok = len(_ENTRIES) > 0
     has_key = bool(os.getenv("OPENROUTER_API_KEY"))
-    return {"ready": kb_ok, "kb_loaded": kb_ok, "has_api_key": has_key}
+    disk_ok = True
+    try:
+        Path(BULLETIN_PATH).parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        disk_ok = False
+    return {"ready": kb_ok and has_key and disk_ok, "kb_loaded": kb_ok, "has_api_key": has_key, "disk_ok": disk_ok}
 
 @app.get("/health")
 def health_check() -> Dict[str, Any]:
@@ -420,39 +454,37 @@ def health_check() -> Dict[str, Any]:
         "bm25": bool(_BM25_AVAILABLE and _BM25 is not None),
         "rate_limit_rpm": RATE_LIMIT_RPM if RATE_LIMIT_ENABLED else 0,
         "orjson": _ORJSON,
+        "bulletin_exists": Path(BULLETIN_PATH).exists()
     }
 
 @app.post("/analyze-query")
 async def analyze_query(request: QueryRequest) -> Dict[str, Any]:
-    # sanityzacja zapytania
     q = (request.query or "").strip()
     if not q:
         raise HTTPException(status_code=422, detail="Puste zapytanie.")
     if len(q) > MAX_QUERY_CHARS:
         raise HTTPException(status_code=413, detail=f"Zapytanie zbyt długie (>{MAX_QUERY_CHARS} znaków).")
 
-    # Blokada ujawniania wewnętrznej KB: meta-zapytania o bazę wiedzy
+    # Meta-pytania o bazę: nie ujawniamy składu; zwracamy tylko zakres
     if _is_kb_meta_query(q):
         return {"zadania": ["META_KB_SCOPE_ONLY"]}
 
-    # 1) Kategoryzacja domeny
+    # Kategoryzacja domeny
     k_prompt = PROMPT_KATEGORYZACJA.format(query=q)
     k_raw = (await llm_call(k_prompt, model=LLM_PLANNER_MODEL)).strip().upper()
     k_value = "TAK" if k_raw == "TAK" else ("NIE" if k_raw == "NIE" else "TAK")
     if k_value == "NIE":
         return {"zadania": ["ODRZUCONE_SPOZA_DOMENY"]}
 
-    # 2) Plan zadań (JSON + walidacja)
+    # Plan zadań (JSON)
     p_prompt = PROMPT_ANALIZA_ZAPYTANIA.format(query=q)
     p_raw = await llm_call(p_prompt, model=LLM_PLANNER_MODEL)
-
     m = re.search(r"\{[\s\S]*\}", p_raw)
     plan_json = m.group(0) if m else '{"zadania":["analiza_prawna"]}'
     try:
         plan = PlanZadania.model_validate_json(plan_json)
     except ValidationError:
         plan = PlanZadania(zadania=["analiza_prawna"])
-
     return plan.model_dump()
 
 @app.get("/knowledge/search", response_model=List[SearchHit])
@@ -461,7 +493,7 @@ async def knowledge_search(q: str = Query(..., min_length=2), k: int = Query(MAX
 
 @app.post("/gate-and-format-response")
 async def gate_and_format_response(request: SynthesisRequest):
-    # sentinel: poza domeną
+    # Poza domeną
     if request.analiza_prawna == "ODRZUCONE_SPOZA_DOMENY":
         final_md = (
             "Dziękuję za Twoje pytanie. Nazywam się Asystent Prawa Oświatowego, a moja wiedza "
@@ -470,7 +502,7 @@ async def gate_and_format_response(request: SynthesisRequest):
         )
         return Response(content=final_md, media_type="text/markdown; charset=utf-8")
 
-    # sentinel: meta-zapytanie o KB → zakres, bez ujawniania składu
+    # Meta-pytanie o KB → zakres bez ujawniania składu
     if request.analiza_prawna == "META_KB_SCOPE_ONLY":
         final_md = (
             "---\n"
@@ -487,13 +519,13 @@ async def gate_and_format_response(request: SynthesisRequest):
         )
         return Response(content=final_md, media_type="text/markdown; charset=utf-8")
 
-    # 400 jeśli wszystkie komponenty są puste
+    # Brak treści
     if _all_components_empty(request):
         raise HTTPException(status_code=400, detail="Brak treści do zsyntezowania (wszystkie komponenty puste).")
 
     analiza = sanitize_component(request.analiza_prawna)
     wery = sanitize_component(request.wynik_weryfikacji)
-    biul = sanitize_component(request.biuletyn_informacyjny)
+    biul = sanitize_component(request.biuletyn_informacyjny) or _load_bulletin_text()
 
     prompt = PROMPT_SYNTEZA_ODPOWIEDZI.format(
         analiza_prawna=analiza or "(brak danych)",
@@ -504,19 +536,18 @@ async def gate_and_format_response(request: SynthesisRequest):
     final_md = await llm_call(prompt, model=LLM_DEFAULT_MODEL)
     return Response(content=final_md, media_type="text/markdown; charset=utf-8")
 
-# --- Admin: wymuszenie przeładowania indeksu (bez uploadu) ---
+# Admin: reload KB (bez uploadu)
 @app.post("/admin/reload-index")
 async def admin_reload_index():
     _load_index(KNOWLEDGE_INDEX_PATH)
     return {"ok": True, "entries": len(_ENTRIES)}
 
-# --- Admin: upload nowego index.json (multipart) – domyślnie OFF ---
+# Admin: upload index.json (multipart) – jeśli ALLOW_UPLOADS=true
 @app.post("/admin/upload-index")
 async def admin_upload_index(file: UploadFile = File(...), request: Request = None):
     if not ALLOW_UPLOADS:
         raise HTTPException(status_code=403, detail="Upload wyłączony (ALLOW_UPLOADS=false).")
 
-    # Content-Length guard
     if request:
         cl = request.headers.get("content-length")
         if cl and int(cl) > MAX_UPLOAD_BYTES:
@@ -531,7 +562,7 @@ async def admin_upload_index(file: UploadFile = File(...), request: Request = No
     try:
         content = await file.read()
         data = json.loads(content.decode("utf-8"))
-        _validate_index_payload(data)  # twardsza walidacja
+        _validate_index_payload(data)
         with open(KNOWLEDGE_INDEX_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         _load_index(KNOWLEDGE_INDEX_PATH)
@@ -541,9 +572,19 @@ async def admin_upload_index(file: UploadFile = File(...), request: Request = No
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload nieudany: {e}")
 
-# --------------------------------------------------------------------------------------
-# DEV ENTRYPOINT
-# --------------------------------------------------------------------------------------
+# Admin: CRON – odśwież biuletyn (ISAP/RCL/MEN + Infor)
+@app.post("/admin/refresh-public-sources")
+async def refresh_public_sources(request: Request):
+    if not ADMIN_KEY or request.headers.get("X-APO-Key") != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if refresh_all_sources is None:
+        raise HTTPException(status_code=501, detail="Brak modułu public_sources.refresh_all")
+    payload = refresh_all_sources()
+    Path(BULLETIN_PATH).parent.mkdir(parents=True, exist_ok=True)
+    Path(BULLETIN_PATH).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "items": len(payload.get("items", [])), "updated": payload.get("updated_at")}
+
+# DEV entrypoint
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)

@@ -1,0 +1,21 @@
+{
+  "updated_at": "2025-09-02T06:00:00Z",
+  "items": [
+    {
+      "title": "Rozporządzenie MEN z dnia ...",
+      "link": "https://dziennikustaw.gov.pl/...",
+      "date": "2025-09-02",
+      "source": "Dziennik Ustaw (RCL)",
+      "source_type": "official",
+      "summary": "Publikacja zmian dotyczących ..."
+    },
+    {
+      "title": "Zmiany w Karcie Nauczyciela od 2025",
+      "link": "https://www.infor.pl/prawo/oswiata/...",
+      "date": "2025-09-02",
+      "source": "Infor.pl – Prawo oświatowe",
+      "source_type": "unofficial",
+      "summary": "Artykuł omawia praktyczne skutki ..."
+    }
+  ]
+}

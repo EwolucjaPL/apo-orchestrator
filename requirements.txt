@@ -10,3 +10,6 @@ scikit-learn>=1.5,<2       # np. przyszłe modele ML w RAG
 rank-bm25>=0.2,<0.3        # lepsze wyszukiwanie w RAG
 tqdm>=4.66,<5              # wygodne progress-bary (przydatne przy trenowaniu/offline)
 python-multipart>=0.0.9,<0.1  # obsługa uploadów (np. admin/upload-index)
+requests>=2.32.0
+beautifulsoup4>=4.12.2
+starlette>=0.37.2,<0.41

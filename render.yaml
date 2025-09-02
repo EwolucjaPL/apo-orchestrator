@@ -1,0 +1,60 @@
+# render.yaml
+
+services:
+  - type: web
+    name: apo-orchestrator-1
+    env: python
+    plan: starter   # dostosuj wg potrzeb
+    autoDeploy: true
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+    disk:
+      name: apo-data
+      mountPath: /var/apo
+      sizeGB: 1   # zwykle wystarczy 1–2 GB na biuletyn + logi
+
+    envVars:
+      - key: OPENROUTER_API_KEY     # klucz do wywołań LLM
+        sync: false                 # ustaw w Render Dashboard (nie commituj wartości)
+      - key: APO_ADMIN_KEY          # klucz do /admin/refresh-public-sources
+        sync: false
+      - key: BULLETIN_PATH
+        value: /var/apo/bulletin.json
+      - key: KNOWLEDGE_INDEX_PATH
+        value: index.json           # jeśli trzymasz KB w repo (demo)
+      - key: LLM_DEFAULT_MODEL
+        value: openai/gpt-4o
+      - key: LLM_PLANNER_MODEL
+        value: mistralai/mistral-7b-instruct:free
+      - key: RATE_LIMIT_ENABLED
+        value: "true"
+      - key: RATE_LIMIT_RPM
+        value: "120"
+      - key: LEGAL_STATUS_DEFAULT_DATE
+        value: "1 września 2025 r."
+      - key: PUBLIC_BASE_URL
+        value: https://apo-orchestrator-1.onrender.com
+
+schedules:
+  # CRON 2×/dobę: 06:00 i 18:00 UTC (dostosuj strefę wg potrzeb)
+  - name: refresh-public-sources-morning
+    type: cron
+    schedule: "0 6 * * *"
+    env: python
+    plan: starter
+    command: >
+      bash -lc
+      "curl -fsS -X POST -H \"X-APO-Key: $APO_ADMIN_KEY\"
+      \"$PUBLIC_BASE_URL/admin/refresh-public-sources\" || true"
+
+  - name: refresh-public-sources-evening
+    type: cron
+    schedule: "0 18 * * *"
+    env: python
+    plan: starter
+    command: >
+      bash -lc
+      "curl -fsS -X POST -H \"X-APO-Key: $APO_ADMIN_KEY\"
+      \"$PUBLIC_BASE_URL/admin/refresh-public-sources\" || true"
