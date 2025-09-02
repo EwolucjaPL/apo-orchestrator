@@ -4,9 +4,7 @@ import re
 import asyncio
 import uuid
 from time import monotonic
-from collections import Counter
 from typing import List, Optional, Dict, Any, Tuple
-from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Response, Request, UploadFile, File
@@ -24,22 +22,22 @@ from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
-# ORJSON (szybsza serializacja) – fallback do JSONResponse, jeśli brak
-try:
-    from fastapi.responses import ORJSONResponse
-    _ORJSON = True
-except Exception:
-    ORJSONResponse = JSONResponse  # fallback
-    _ORJSON = False
 
-
-# ======================================================================================
-# KONFIGURACJA
-# ======================================================================================
+# ==============================================================================
+# KONFIGURACJA PODSTAWOWA
+# ==============================================================================
 load_dotenv()
 
 APP_TITLE = "APO Gateway"
 APP_DESC = "Gateway + mini-RAG dla prawa oświatowego"
+
+# ORJSON fallback
+try:
+    from fastapi.responses import ORJSONResponse
+    _ORJSON = True
+except Exception:
+    ORJSONResponse = JSONResponse  # type: ignore
+    _ORJSON = False
 
 app = FastAPI(
     title=APP_TITLE,
@@ -47,7 +45,7 @@ app = FastAPI(
     default_response_class=ORJSONResponse if _ORJSON else JSONResponse,
 )
 
-# ENV / domyślne
+# ENV
 LLM_DEFAULT_MODEL = os.getenv("LLM_DEFAULT_MODEL", "openai/gpt-4o")
 LLM_PLANNER_MODEL = os.getenv("LLM_PLANNER_MODEL", "mistralai/mistral-7b-instruct:free")
 KNOWLEDGE_INDEX_PATH = os.getenv("KNOWLEDGE_INDEX_PATH", "index.json")
@@ -61,6 +59,10 @@ LEGAL_STATUS_DEFAULT_DATE = os.getenv("LEGAL_STATUS_DEFAULT_DATE", "1 września 
 BULLETIN_PATH = os.getenv("BULLETIN_PATH", "/var/apo/bulletin.json")
 ADMIN_KEY = os.getenv("APO_ADMIN_KEY")
 
+# Denylista (bezwzględny zakaz ujawniania)
+DENYLIST_PATH = os.getenv("APO_KB_DENYLIST_PATH", "/var/apo/denylist.json")
+ENV_DENYLIST = os.getenv("APO_KB_DENYLIST", "")  # np. "Tytuł A;Tytuł B;Komentarz KN"
+
 # CORS + kompresja
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 ALLOW_ORIGINS = CORS_ORIGINS if CORS_ORIGINS else ["*"]
@@ -69,18 +71,17 @@ app.add_middleware(
     allow_origins=ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["content-type", "authorization", "x-request-id"],
+    allow_headers=["content-type", "authorization", "x-request-id", "x-apo-key"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=500)
 if _PROXY_HEADERS_AVAILABLE:
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
-# Rate-limit per IP (in-memory; dla 1 procesu)
+# Rate-limit per IP (in-memory; 1 proces)
 _RATE_LOG: Dict[str, List[float]] = {}
 
 _client: Optional[AsyncOpenAI] = None
 def get_client() -> AsyncOpenAI:
-    """Twórz klienta dopiero przy pierwszym użyciu; brak klucza = 503 przy wywołaniu."""
     global _client
     if _client is None:
         key = os.getenv("OPENROUTER_API_KEY")
@@ -92,7 +93,10 @@ def get_client() -> AsyncOpenAI:
 def _make_request_id() -> str:
     return str(uuid.uuid4())
 
-# Middleware: X-Request-Id + rate-limit
+
+# ==============================================================================
+# MIDDLEWARE: request-id, rate-limit, security headers
+# ==============================================================================
 @app.middleware("http")
 async def request_context(request: Request, call_next):
     rid = request.headers.get("X-Request-Id") or _make_request_id()
@@ -103,7 +107,6 @@ async def request_context(request: Request, call_next):
         cutoff = now - 60
         while bucket and bucket[0] < cutoff:
             bucket.pop(0)
-        # biała lista
         if len(bucket) >= RATE_LIMIT_RPM and request.url.path not in ("/health", "/ready", "/live", "/"):
             return ORJSONResponse(
                 {"detail": "Rate limit exceeded. Try again later."},
@@ -115,7 +118,6 @@ async def request_context(request: Request, call_next):
     resp.headers["X-Request-Id"] = rid
     return resp
 
-# Bezpieczne nagłówki
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     resp = await call_next(request)
@@ -124,21 +126,10 @@ async def security_headers(request: Request, call_next):
     resp.headers.setdefault("Referrer-Policy", "no-referrer")
     return resp
 
-# Handlery wyjątków
-@app.exception_handler(HTTPException)
-async def http_exc_handler(request: Request, exc: HTTPException):
-    rid = request.headers.get("X-Request-Id") or _make_request_id()
-    return ORJSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers={"X-Request-Id": rid})
 
-@app.exception_handler(Exception)
-async def unhandled_exc_handler(request: Request, exc: Exception):
-    rid = request.headers.get("X-Request-Id") or _make_request_id()
-    return ORJSONResponse({"detail": "Internal server error"}, status_code=500, headers={"X-Request-Id": rid})
-
-
-# ======================================================================================
+# ==============================================================================
 # PROMPTY
-# ======================================================================================
+# ==============================================================================
 PROMPT_KATEGORYZACJA = (
     "Your only task is to assess if the following query is exclusively about Polish educational law. "
     "Your domain includes: Teacher's Charter, school management, student rights, pedagogical supervision. "
@@ -153,7 +144,6 @@ PROMPT_ANALIZA_ZAPYTANIA = (
     "Respond ONLY with valid JSON, no explanations.\n\nQuery: \"{query}\""
 )
 
-# 9-sekcyjny format + nieujawnianie wewnętrznej KB + większe odstępy
 PROMPT_SYNTEZA_ODPOWIEDZI = (
     "You are Asystent Prawa Oświatowego. Assemble the verified components into a single, "
     "coherent, professional, and crystal-clear answer in Polish for school leaders. "
@@ -187,9 +177,10 @@ PROMPT_SYNTEZA_ODPOWIEDZI = (
     "- Pisz krótko, jasno, zorientowanie na dyrektorów szkół.\n"
 )
 
-# ======================================================================================
+
+# ==============================================================================
 # MODELE
-# ======================================================================================
+# ==============================================================================
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=3, max_length=MAX_QUERY_CHARS)
 
@@ -204,25 +195,26 @@ class SynthesisRequest(BaseModel):
 class SearchHit(BaseModel):
     id: str
     title: str
-    book: Optional[str] = None
-    chapter: Optional[str] = None
     score: float
     snippet: str
+    book: Optional[str] = None
+    chapter: Optional[str] = None
 
 
-# ======================================================================================
-# MINI-RAG (opcjonalnie BM25)
-# ======================================================================================
+# ==============================================================================
+# KB: ładowanie indeksu i wyszukiwanie
+# ==============================================================================
 IndexEntry = Dict[str, Any]
 _INDEX_METADATA: Dict[str, Any] = {}
 _ENTRIES: List[IndexEntry] = []
-_BM25 = None
 
 try:
-    from rank_bm25 import BM25Okapi  # type: ignore
+    from rank_bm25 import BM25Okapi  # optional
     _BM25_AVAILABLE = True
 except Exception:
     _BM25_AVAILABLE = False
+
+_BM25 = None
 
 def _normalize_text(t: str) -> str:
     return re.sub(r"\s+", " ", t.lower()).strip()
@@ -247,9 +239,10 @@ def _build_bm25():
     if _BM25_AVAILABLE and _ENTRIES:
         corpus = [e.get("_tokens", []) for e in _ENTRIES]
         _BM25 = BM25Okapi(corpus)
+    else:
+        _BM25 = None
 
 def _load_index(path: str) -> None:
-    """Ładuj KB; jeśli brak pliku – startuj na pustym (serwis wstaje)."""
     global _INDEX_METADATA, _ENTRIES
     if not os.path.exists(path):
         _INDEX_METADATA = {"version": "empty"}
@@ -270,36 +263,33 @@ def _load_index(path: str) -> None:
 
 _load_index(KNOWLEDGE_INDEX_PATH)
 
-def _score_entry_tf(query_tokens: List[str], entry: IndexEntry) -> float:
-    if not query_tokens:
+def _score_entry_tf(qt: List[str], entry: IndexEntry) -> float:
+    if not qt:
         return 0.0
-    cnt = Counter(entry.get("_tokens", []))
-    score = sum(cnt[tok] for tok in query_tokens)
-    title = entry.get("_title_norm", "")
-    q_join = " ".join(query_tokens)
-    if q_join and q_join in title:
+    toks = entry.get("_tokens", [])
+    score = sum(1 for t in toks if t in qt)
+    if " ".join(qt) in entry.get("_title_norm", ""):
         score += 2.0
     return float(score)
 
 def search_entries(query: str, k: int = 5) -> List[SearchHit]:
-    q_tokens = _tokenize(query)
-    hits: List[SearchHit] = []
-
-    if _BM25_AVAILABLE and _BM25 is not None:
-        scores = _BM25.get_scores(q_tokens)
-        ranked_pairs: List[Tuple[float, IndexEntry]] = list(zip(map(float, scores), _ENTRIES))
-        ranked = sorted(ranked_pairs, key=lambda x: x[0], reverse=True)[:k]
+    qt = _tokenize(query)
+    ranked: List[Tuple[float, IndexEntry]] = []
+    if _BM25 is not None:
+        scores = _BM25.get_scores(qt)
+        ranked = sorted(list(zip(map(float, scores), _ENTRIES)), key=lambda x: x[0], reverse=True)[:k]
     else:
-        scored: List[Tuple[float, IndexEntry]] = []
+        tmp: List[Tuple[float, IndexEntry]] = []
         for e in _ENTRIES:
-            s = _score_entry_tf(q_tokens, e)
+            s = _score_entry_tf(qt, e)
             if s > 0:
-                scored.append((s, e))
-        ranked = sorted(scored, key=lambda x: x[0], reverse=True)[:k]
+                tmp.append((s, e))
+        ranked = sorted(tmp, key=lambda x: x[0], reverse=True)[:k]
 
+    hits: List[SearchHit] = []
     for s, e in ranked:
-        snippet = e.get("summary", "")
-        snippet = snippet[:600] + ("…" if len(snippet) > 600 else "")
+        snip = e.get("summary", "")
+        snip = snip[:600] + ("…" if len(snip) > 600 else "")
         hits.append(
             SearchHit(
                 id=e.get("id", ""),
@@ -307,15 +297,15 @@ def search_entries(query: str, k: int = 5) -> List[SearchHit]:
                 book=e.get("book"),
                 chapter=e.get("chapter"),
                 score=float(s),
-                snippet=snippet,
+                snippet=snip,
             )
         )
     return hits
 
 
-# ======================================================================================
-# LLM (z retry)
-# ======================================================================================
+# ==============================================================================
+# LLM + sanity
+# ==============================================================================
 async def llm_call(prompt: str, model: str = LLM_DEFAULT_MODEL, timeout: float = 30.0) -> str:
     async def _once() -> str:
         client = get_client()
@@ -345,42 +335,37 @@ async def llm_call(prompt: str, model: str = LLM_DEFAULT_MODEL, timeout: float =
 def sanitize_component(text: Optional[str]) -> str:
     if not text:
         return ""
-    text = re.sub(r"```.*?```", " ", text, flags=re.S)
-    text = re.sub(r"(^|\n)\s*#{1,6}.*", " ", text)
-    text = text.replace("<|system|>", "").replace("<|assistant|>", "").replace("<|user|>", "")
-    text = text.replace("\u2028", " ").replace("\u2029", " ")
-    return text.strip()
-
-def _all_components_empty(req: "SynthesisRequest") -> bool:
-    def _empty(x: Optional[str]) -> bool:
-        return (x is None) or (isinstance(x, str) and len(x.strip()) == 0)
-    return _empty(req.analiza_prawna) and _empty(req.wynik_weryfikacji) and _empty(req.biuletyn_informacyjny)
+    txt = text
+    txt = re.sub(r"```.*?```", " ", txt, flags=re.S)
+    txt = re.sub(r"(^|\n)\s*#{1,6}.*", " ", txt)
+    txt = txt.replace("<|system|>", "").replace("<|assistant|>", "").replace("<|user|>", "")
+    txt = txt.replace("\u2028", " ").replace("\u2029", " ")
+    return txt.strip()
 
 
-# ======================================================================================
-# Polityka: nie ujawniamy składu KB (wykrywanie metapytania)
-# ======================================================================================
+# ==============================================================================
+# POLITYKA: meta-pytania o bazę (nie ujawniamy składu)
+# ==============================================================================
 _KB_META_PATTERNS = [
-    r"\bbaza wiedzy\b",
-    r"\bspis treści\b", r"\bspis tresci\b",
-    r"\bjakich źródeł\b", r"\bjakich zrodel\b",
-    r"\bjakie źródła\b", r"\bjakie zrodla\b",
-    r"\bz jakich dokumentów\b", r"\bz jakich dokumentow\b",
-    r"\bjakie dokumenty masz\b", r"\bco masz w bazie\b",
-    r"\bpokaż bazę\b", r"\bpokaz baze\b",
-    r"\blista źródeł\b", r"\blista zrodel\b",
+    r"\bbaza wiedzy\b", r"\bco masz w bazie\b", r"\bpoka(ż|z) baz(ę|e)\b",
+    r"\bspis (treści|tresci)\b", r"\blista (źródeł|zrodel)\b", r"\bwykaz (źródeł|zrodel)\b",
+    r"\bjakich (źródeł|zrodel) używasz\b", r"\bsk(ą|a)d bierzesz dane\b",
+    r"\bjakie dokumenty\b", r"\bjakie (źródła|zrodla)\b", r"\brepozytorium\b", r"\bzaplecze\b",
+    r"\bbibliografia\b",
+    # EN / bez PL znaków
+    r"\bknowledge base\b", r"\bbibliography\b", r"\byour sources\b", r"\bwhat sources\b", r"\blist your sources\b"
 ]
 def _is_kb_meta_query(text: str) -> bool:
-    t = text.lower().strip()
+    t = (text or "").lower().strip()
     for pat in _KB_META_PATTERNS:
         if re.search(pat, t):
             return True
     return False
 
 
-# ======================================================================================
-# BIULETYN: wczytywanie lokalnego feedu i endpoint do CRON-a
-# ======================================================================================
+# ==============================================================================
+# BIULETYN (oficjalne + nieoficjalne) + CRON admin
+# ==============================================================================
 def _load_bulletin_text() -> str:
     p = Path(BULLETIN_PATH)
     if not p.exists():
@@ -410,74 +395,252 @@ def _load_bulletin_text() -> str:
     except Exception:
         return ""
 
-# Import aktualizatora źródeł (osobny plik public_sources.py)
 try:
-    from public_sources import refresh_all as refresh_all_sources  # zgodnie z Twoim modułem
+    from public_sources import refresh_all as refresh_all_sources  # opcjonalny moduł
 except Exception:
-    refresh_all_sources = None  # brak – endpoint zwróci 501
+    refresh_all_sources = None
 
 
-# ======================================================================================
-# POMOCNICZE: gotowe wiadomości w 9-sekcyjnym formacie
-# ======================================================================================
-def _md_block_separator() -> str:
+# ==============================================================================
+# FORMATOWANIE 9-SEKCYJNE + maskowanie + denylista
+# ==============================================================================
+_SECTION_ORDER = [
+    "Weryfikacja pytania",
+    "Komunikat weryfikacji",
+    "Podstawa prawna ⚖️",
+    "Interpretacja prawna 💡",
+    "Procedura krok po kroku 📝",
+    "Odpowiedź wprost 🎯",
+    "Proaktywna sugestia 💡",
+    "Disclaimer prawny ⚖️",
+    "Dodatkowa oferta wsparcia 🤝",
+]
+_SOURCES_HEADER = "Źródła"
+
+def _md_sep() -> str:
     return "---\n"
 
-def _two_blank_lines() -> str:
+def _dbl_nl() -> str:
     return "\n\n"
 
+def enforce_nine_section_format(md: str) -> str:
+    """
+    Upewnia się, że są dokładnie te sekcje i w tej kolejności,
+    poprzedzone '---' i z dwoma pustymi liniami po treści.
+    Dodaje brakujące sekcje z '(brak danych)'.
+    Dba o 'Stan prawny' w Podstawie prawnej i w Disclaimerze.
+    Zapewnia obecność bloku 'Źródła' na końcu.
+    """
+    if not md:
+        md = ""
+
+    # Normalizacja: usuń CRLF
+    text = md.replace("\r\n", "\n").strip()
+
+    # Wyciągnij sekcje po wzorcu **Nazwa**
+    # Dopuszczamy ewentualne spacje po gwiazdkach.
+    pattern = r"\*\*\s*(.+?)\s*\*\*"
+    parts = re.split(pattern, text)
+    # re.split daje: [pre, h1, content_after_h1, h2, content_after_h2, ...]
+    # Zbuduj mapę {header: content}
+    parsed: Dict[str, str] = {}
+    preface = ""
+    if parts:
+        preface = parts[0].strip()
+        it = iter(parts[1:])
+        for head, content in zip(it, it):
+            parsed[head.strip()] = content.strip()
+
+    out_lines: List[str] = []
+
+    for sec in _SECTION_ORDER:
+        out_lines.append(_md_sep() + f"**{sec}**")
+        content = parsed.get(sec, "").strip()
+        if not content:
+            content = "(brak danych)"
+        # Korekta 'Komunikat weryfikacji' jeżeli zbyt rozstrzygający:
+        if sec == "Komunikat weryfikacji":
+            # Jeśli pojawia się 'tak/nie' + czasownik przesądzający, przeredaguj na neutralny komunikat
+            if re.search(r"(?i)\b(tak|nie)\b.*\b(ma|może|nie może|przysługuje|nie przysługuje|obowiązuje)\b", content):
+                # Spróbuj użyć pierwszego zdania z 'Weryfikacja pytania' jako zakresu
+                wery = parsed.get("Weryfikacja pytania", "").strip()
+                first_sent = wery.split(".")[0].strip() if wery else "prawa oświatowego"
+                content = f"✅ Pytanie dotyczy: {first_sent if first_sent else 'prawa oświatowego'}."
+            elif not content.startswith("✅"):
+                content = "✅ Potwierdzam zakres pytania (prawo oświatowe)."
+
+        # Dopnij 'Stan prawny' w Podstawie prawnej
+        if sec == "Podstawa prawna ⚖️" and "Stan prawny:" not in content:
+            if not content.endswith("\n"):
+                content += "\n"
+            content += f"Stan prawny: {LEGAL_STATUS_DEFAULT_DATE} (domyślny)."
+
+        # Dopnij 'Stan prawny' w Disclaimerze
+        if sec == "Disclaimer prawny ⚖️" and "Stan prawny:" not in content:
+            if not content.endswith("\n"):
+                content += "\n"
+            content += f"Stan prawny: {LEGAL_STATUS_DEFAULT_DATE}."
+
+        out_lines.append(content)
+        out_lines.append(_dbl_nl())
+
+    # Blok Źródła – jeśli nie było, dołóż domyślne
+    sources_content = parsed.get(_SOURCES_HEADER, "").strip()
+    if not sources_content:
+        sources_content = "– ISAP (akty prawne)\n– Dziennik Ustaw / RCL\n– MEN – komunikaty i rozporządzenia"
+
+    out_lines.append(_md_sep() + f"**{_SOURCES_HEADER}**")
+    out_lines.append(sources_content)
+    # bez dodatkowego podwójnego odstępu na końcu
+    return "\n".join(out_lines).strip()
+
+# maskowanie odniesień do prywatnych plików/ID
+_PRIVATE_PATTERNS = [
+    r"\bautor_APO\b",
+    r"\b[A-Za-z0-9/_-]+\.(md|json|pdf)\b",
+    r"\bnowoczesne[-\s]zarzadzanie[-\s]szkola\b",
+    r"\bprawa[-\s]i[-\s]obowiazki[-\s]dyrektora\b",
+    r"\bkomentarz( |\b).*karta( |\b) nauczyciela\b",
+]
+def mask_private_kb_references(text: str) -> str:
+    if not text:
+        return text
+    lines = text.splitlines()
+    out = []
+    for ln in lines:
+        drop = False
+        for pat in _PRIVATE_PATTERNS:
+            if re.search(pat, ln, flags=re.IGNORECASE):
+                drop = True
+                break
+        out.append("" if drop else ln)
+    return "\n".join(out)
+
+# denylista – ładowanie i redakcja
+_DENY_PATTERNS_RAW: List[str] = []
+_DENY_REGEXES: List[re.Pattern] = []
+
+def _load_denylist():
+    global _DENY_PATTERNS_RAW, _DENY_REGEXES
+    patterns: List[str] = []
+
+    if ENV_DENYLIST.strip():
+        parts = [p.strip() for p in ENV_DENYLIST.split(";") if p.strip()]
+        patterns.extend(parts)
+
+    try:
+        p = Path(DENYLIST_PATH)
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("patterns"), list):
+                patterns.extend([str(x) for x in data["patterns"] if str(x).strip()])
+    except Exception:
+        pass
+
+    # deduplikacja
+    seen = set()
+    clean: List[str] = []
+    for ptn in patterns:
+        if ptn not in seen:
+            seen.add(ptn)
+            clean.append(ptn)
+
+    _DENY_PATTERNS_RAW = clean
+    _DENY_REGEXES = []
+    for pat in clean:
+        try:
+            rx = re.compile(pat, flags=re.IGNORECASE | re.UNICODE)
+        except Exception:
+            rx = re.compile(re.escape(pat), flags=re.IGNORECASE | re.UNICODE)
+        _DENY_REGEXES.append(rx)
+
+_load_denylist()
+
+def redact_denied_titles(text: str) -> str:
+    """Usuwa całe linie zawierające wzorce z denylisty (bezwzględny zakaz ujawniania)."""
+    if not text or not _DENY_REGEXES:
+        return text
+    lines = text.splitlines()
+    redacted = []
+    for ln in lines:
+        ls = ln.strip()
+        if not ls:
+            redacted.append(ln)
+            continue
+        matched = any(rx.search(ls) for rx in _DENY_REGEXES)
+        if not matched:
+            redacted.append(ln)
+    return "\n".join(redacted)
+
+def _redact_search_hits(hits: List[SearchHit]) -> List[SearchHit]:
+    if not _DENY_REGEXES:
+        return hits
+    out: List[SearchHit] = []
+    for h in hits:
+        t = h.title or ""
+        s = h.snippet or ""
+        if any(rx.search(t) or rx.search(s) for rx in _DENY_REGEXES):
+            continue  # wytnij cały wynik
+        out.append(h)
+    return out
+
+
+# ==============================================================================
+# UŻYTECZNE MARKDOWNY DLA SCENARIUSZY KRAWĘDZIOWYCH
+# ==============================================================================
 def _refusal_markdown() -> str:
-    """Ujednolicona odmowa (poza domeną) w tym samym układzie 9 sekcji."""
-    parts = []
-    parts.append(_md_block_separator() + "**Weryfikacja pytania**\nTo pytanie nie dotyczy polskiego prawa oświatowego.")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Komunikat weryfikacji**\n✅ Pytanie wykracza poza zakres Asystenta Prawa Oświatowego (prawo oświatowe).")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Podstawa prawna ⚖️**\n– (brak danych)\nStan prawny: " + LEGAL_STATUS_DEFAULT_DATE + " (domyślny).")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Interpretacja prawna 💡**\nAsystent Prawa Oświatowego udziela informacji wyłącznie w obszarze prawa oświatowego (Karta Nauczyciela, Prawo oświatowe, akty MEN). Pytania z zakresu podatków, ubezpieczeń, prawa cywilnego czy gospodarczego nie są obsługiwane.")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Procedura krok po kroku 📝**\n1. Sformułuj pytanie dotyczące prawa oświatowego.\n2. Jeśli chodzi o inną dziedzinę (np. VAT), skonsultuj się ze specjalistą w danej dziedzinie.\n3. Podaj kontekst (typ szkoły, etap edukacyjny), aby uzyskać precyzyjniejszą odpowiedź.")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Odpowiedź wprost 🎯**\n**Nie – nie odpowiadam na pytania spoza domeny prawa oświatowego.**")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Proaktywna sugestia 💡**\nRozważ zadanie pytania dotyczącego Karty Nauczyciela, obowiązków dyrektora, organizacji pracy szkoły lub uprawnień uczniów.")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Disclaimer prawny ⚖️**\nOdpowiedź ma charakter ogólny i dotyczy wyłącznie prawa oświatowego. Stan prawny: " + LEGAL_STATUS_DEFAULT_DATE + ".")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Dodatkowa oferta wsparcia 🤝**\nCzy chcesz, abym pomógł przeformułować pytanie tak, aby dotyczyło prawa oświatowego?")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Źródła**\n– (brak – pytanie spoza domeny)")
-    return "".join(parts)
+    parts: List[str] = []
+    def add(sec_title: str, body: str):
+        parts.append(_md_sep() + f"**{sec_title}**")
+        parts.append(body)
+        parts.append(_dbl_nl())
+
+    add("Weryfikacja pytania", "To pytanie nie dotyczy polskiego prawa oświatowego.")
+    add("Komunikat weryfikacji", "✅ Pytanie wykracza poza zakres Asystenta Prawa Oświatowego (prawo oświatowe).")
+    add("Podstawa prawna ⚖️", f"– (brak danych)\nStan prawny: {LEGAL_STATUS_DEFAULT_DATE} (domyślny).")
+    add("Interpretacja prawna 💡", "Asystent Prawa Oświatowego udziela informacji wyłącznie w obszarze prawa oświatowego. "
+                                   "Pytania z zakresu podatków, ubezpieczeń, prawa cywilnego lub gospodarczego nie są obsługiwane.")
+    add("Procedura krok po kroku 📝", "1. Sformułuj pytanie dotyczące prawa oświatowego.\n"
+                                      "2. W pytaniach spoza domeny skonsultuj specjalistę w danej dziedzinie.\n"
+                                      "3. Podaj kontekst (typ szkoły, etap), aby doprecyzować odpowiedź.")
+    add("Odpowiedź wprost 🎯", "**Nie – nie odpowiadam na pytania spoza domeny prawa oświatowego.**")
+    add("Proaktywna sugestia 💡", "Rozważ zadanie pytania o Kartę Nauczyciela, Prawo oświatowe, statut szkoły, rady pedagogiczne.")
+    add("Disclaimer prawny ⚖️", f"Odpowiedź ma charakter ogólny i dotyczy wyłącznie prawa oświatowego.\nStan prawny: {LEGAL_STATUS_DEFAULT_DATE}.")
+    add("Dodatkowa oferta wsparcia 🤝", "Czy chcesz, abym pomógł przeformułować pytanie w zakresie prawa oświatowego?")
+    parts.append(_md_sep() + "**Źródła**\n– (brak – pytanie spoza domeny)")
+    return "\n".join(parts).strip()
 
 def _kb_scope_markdown() -> str:
-    """Ujednolicona odpowiedź na meta-pytanie o bazę (zakres, bez ujawniania składu)."""
-    parts = []
-    parts.append(_md_block_separator() + "**Weryfikacja pytania**\nProśba o przedstawienie bazy wiedzy i źródeł.")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Komunikat weryfikacji**\n✅ Pytanie dotyczy zakresu tematycznego i rodzaju źródeł wykorzystywanych przez APO.")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Podstawa prawna ⚖️**\n– Karta Nauczyciela (ustawa z 26 stycznia 1982 r.)\n– Prawo oświatowe (ustawa z 14 grudnia 2016 r.)\n– Wybrane rozporządzenia MEN\n– Orzecznictwo oraz oficjalne komunikaty organów administracji\nStan prawny: " + LEGAL_STATUS_DEFAULT_DATE + " (domyślny).")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Interpretacja prawna 💡**\nAPO udziela odpowiedzi wyłącznie w obszarze polskiego prawa oświatowego. W odpowiedziach cytowane są wyłącznie publicznie dostępne akty i dokumenty. Skład wewnętrznych materiałów pomocniczych nie jest ujawniany.")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Procedura krok po kroku 📝**\n1. Podaj konkretne zagadnienie (np. artykuł KN, statut szkoły, arkusz).\n2. Otrzymasz analizę wraz z podstawą prawną i krótką procedurą.\n3. W razie potrzeby doprecyzuj kontekst (typ szkoły, etap, rola pytającego).")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Odpowiedź wprost 🎯**\n**APO przedstawia jedynie ogólny zakres źródeł (akty publiczne) i nie ujawnia składu wewnętrznej bazy wiedzy.**")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Proaktywna sugestia 💡**\nPodaj proszę konkretne pytanie z obszaru prawa oświatowego; przygotuję zwięzłą analizę z podstawą prawną.")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Disclaimer prawny ⚖️**\nOdpowiedź ma charakter ogólny i dotyczy zakresu tematycznego. Stan prawny: " + LEGAL_STATUS_DEFAULT_DATE + ".")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Dodatkowa oferta wsparcia 🤝**\nCzy chcesz, abym zaproponował katalog przykładowych tematów (dyrektor, rada pedagogiczna, KN, statut)?")
-    parts.append(_two_blank_lines())
-    parts.append(_md_block_separator() + "**Źródła**\n– ISAP (akty prawne)\n– Dziennik Ustaw / RCL\n– MEN – komunikaty i rozporządzenia")
-    return "".join(parts)
+    parts: List[str] = []
+    def add(sec_title: str, body: str):
+        parts.append(_md_sep() + f"**{sec_title}**")
+        parts.append(body)
+        parts.append(_dbl_nl())
+
+    add("Weryfikacja pytania", "Prośba o przedstawienie bazy wiedzy i źródeł.")
+    add("Komunikat weryfikacji", "✅ Pytanie dotyczy zakresu tematycznego i rodzaju publicznych źródeł wykorzystywanych przez APO.")
+    add("Podstawa prawna ⚖️", "– Karta Nauczyciela (ustawa z 26 stycznia 1982 r.)\n"
+                               "– Prawo oświatowe (ustawa z 14 grudnia 2016 r.)\n"
+                               "– Rozporządzenia MEN\n"
+                               "– Orzecznictwo i komunikaty organów administracji\n"
+                               f"Stan prawny: {LEGAL_STATUS_DEFAULT_DATE} (domyślny).")
+    add("Interpretacja prawna 💡", "APO udziela odpowiedzi wyłącznie w obszarze polskiego prawa oświatowego. "
+                                   "W odpowiedziach cytowane są wyłącznie publicznie dostępne akty i dokumenty. "
+                                   "Skład wewnętrznych materiałów pomocniczych nie jest ujawniany.")
+    add("Procedura krok po kroku 📝", "1. Podaj konkretne zagadnienie (np. artykuł KN, statut szkoły, arkusz).\n"
+                                      "2. Otrzymasz analizę z podstawą prawną i krótką procedurą.\n"
+                                      "3. W razie potrzeby doprecyzuj kontekst (typ szkoły, etap, rola pytającego).")
+    add("Odpowiedź wprost 🎯", "**APO przedstawia jedynie ogólny zakres publicznych źródeł i nie ujawnia składu wewnętrznej bazy wiedzy.**")
+    add("Proaktywna sugestia 💡", "Podaj konkretne pytanie z obszaru prawa oświatowego; przygotuję zwięzłą analizę z podstawą prawną.")
+    add("Disclaimer prawny ⚖️", f"Odpowiedź ma charakter ogólny i dotyczy zakresu tematycznego.\nStan prawny: {LEGAL_STATUS_DEFAULT_DATE}.")
+    add("Dodatkowa oferta wsparcia 🤝", "Czy chcesz, abym zaproponował katalog przykładowych tematów (dyrektor, rada pedagogiczna, KN, statut)?")
+    parts.append(_md_sep() + "**Źródła**\n– ISAP (akty prawne)\n– Dziennik Ustaw / RCL\n– MEN – komunikaty i rozporządzenia")
+    return "\n".join(parts).strip()
 
 
-# ======================================================================================
-# ENDPOINTY
-# ======================================================================================
+# ==============================================================================
+# ENDPOINTY STATUSOWE
+# ==============================================================================
 @app.get("/")
 def root():
     return {
@@ -517,9 +680,14 @@ def health_check() -> Dict[str, Any]:
         "bm25": bool(_BM25_AVAILABLE and _BM25 is not None),
         "rate_limit_rpm": RATE_LIMIT_RPM if RATE_LIMIT_ENABLED else 0,
         "orjson": _ORJSON,
-        "bulletin_exists": Path(BULLETIN_PATH).exists()
+        "bulletin_exists": Path(BULLETIN_PATH).exists(),
+        "denylist_loaded": len(_DENY_REGEXES) > 0
     }
 
+
+# ==============================================================================
+# PLANOWANIE
+# ==============================================================================
 @app.post("/analyze-query")
 async def analyze_query(request: QueryRequest) -> Dict[str, Any]:
     q = (request.query or "").strip()
@@ -528,7 +696,7 @@ async def analyze_query(request: QueryRequest) -> Dict[str, Any]:
     if len(q) > MAX_QUERY_CHARS:
         raise HTTPException(status_code=413, detail=f"Zapytanie zbyt długie (>{MAX_QUERY_CHARS} znaków).")
 
-    # Meta-pytania o bazę: nie ujawniamy składu; zwracamy tylko zakres
+    # Meta: pytania o bazę/źródła → nie ujawniamy składu
     if _is_kb_meta_query(q):
         return {"zadania": ["META_KB_SCOPE_ONLY"]}
 
@@ -539,7 +707,7 @@ async def analyze_query(request: QueryRequest) -> Dict[str, Any]:
     if k_value == "NIE":
         return {"zadania": ["ODRZUCONE_SPOZA_DOMENY"]}
 
-    # Plan zadań (JSON)
+    # Plan
     p_prompt = PROMPT_ANALIZA_ZAPYTANIA.format(query=q)
     p_raw = await llm_call(p_prompt, model=LLM_PLANNER_MODEL)
     m = re.search(r"\{[\s\S]*\}", p_raw)
@@ -550,27 +718,48 @@ async def analyze_query(request: QueryRequest) -> Dict[str, Any]:
         plan = PlanZadania(zadania=["analiza_prawna"])
     return plan.model_dump()
 
+
+# ==============================================================================
+# WYSZUKIWARKA KB
+# ==============================================================================
 @app.get("/knowledge/search", response_model=List[SearchHit])
 async def knowledge_search(q: str = Query(..., min_length=2), k: int = Query(MAX_RETURN_SNIPPETS, ge=1, le=10)):
-    return search_entries(q, k=k)
+    res = search_entries(q, k=k)
+    res = _redact_search_hits(res)
+    return res
+
+
+# ==============================================================================
+# SYNTEZA
+# ==============================================================================
+def _all_components_empty(req: "SynthesisRequest") -> bool:
+    return not ( (req.analiza_prawna and req.analiza_prawna.strip())
+                 or (req.wynik_weryfikacji and req.wynik_weryfikacji.strip())
+                 or (req.biuletyn_informacyjny and req.biuletyn_informacyjny.strip()) )
 
 @app.post("/gate-and-format-response")
 async def gate_and_format_response(request: SynthesisRequest):
-    # Poza domeną → ujednolicona odmowa w 9 sekcjach (markdown)
+    # Poza domeną → ujednolicona odmowa (również trzymana w 9-sekcyjnym layoucie)
     if request.analiza_prawna == "ODRZUCONE_SPOZA_DOMENY":
-        return Response(content=_refusal_markdown(), media_type="text/markdown; charset=utf-8")
+        md = _refusal_markdown()
+        md = enforce_nine_section_format(md)
+        md = mask_private_kb_references(md)
+        md = redact_denied_titles(md)
+        return Response(content=md, media_type="text/markdown; charset=utf-8")
 
-    # Meta-pytanie o KB → ujednolicona odpowiedź w 9 sekcjach (zakres, bez składu)
+    # Meta-pytanie o KB → tylko zakres
     if request.analiza_prawna == "META_KB_SCOPE_ONLY":
-        return Response(content=_kb_scope_markdown(), media_type="text/markdown; charset=utf-8")
+        md = _kb_scope_markdown()
+        md = enforce_nine_section_format(md)
+        md = mask_private_kb_references(md)
+        md = redact_denied_titles(md)
+        return Response(content=md, media_type="text/markdown; charset=utf-8")
 
-    # Brak treści
     if _all_components_empty(request):
         raise HTTPException(status_code=400, detail="Brak treści do zsyntezowania (wszystkie komponenty puste).")
 
     analiza = sanitize_component(request.analiza_prawna)
     wery = sanitize_component(request.wynik_weryfikacji)
-    # Jeśli brak biuletynu w komponencie – domyślnie dociągnij lokalny bulletin.json (CRON)
     biul = sanitize_component(request.biuletyn_informacyjny) or _load_bulletin_text()
 
     prompt = PROMPT_SYNTEZA_ODPOWIEDZI.format(
@@ -580,15 +769,23 @@ async def gate_and_format_response(request: SynthesisRequest):
         stan_prawny_domyslny=LEGAL_STATUS_DEFAULT_DATE,
     )
     final_md = await llm_call(prompt, model=LLM_DEFAULT_MODEL)
+
+    # Format + ochrona
+    final_md = enforce_nine_section_format(final_md)
+    final_md = mask_private_kb_references(final_md)
+    final_md = redact_denied_titles(final_md)
+
     return Response(content=final_md, media_type="text/markdown; charset=utf-8")
 
-# Admin: reload KB (bez uploadu)
+
+# ==============================================================================
+# ADMIN: KB & biuletyn & denylista
+# ==============================================================================
 @app.post("/admin/reload-index")
 async def admin_reload_index():
     _load_index(KNOWLEDGE_INDEX_PATH)
     return {"ok": True, "entries": len(_ENTRIES)}
 
-# Admin: upload index.json (multipart) – jeśli ALLOW_UPLOADS=true
 @app.post("/admin/upload-index")
 async def admin_upload_index(file: UploadFile = File(...), request: Request = None):
     if not ALLOW_UPLOADS:
@@ -601,7 +798,6 @@ async def admin_upload_index(file: UploadFile = File(...), request: Request = No
 
     if file.content_type not in ("application/json", "text/json", "application/octet-stream"):
         raise HTTPException(status_code=415, detail="Dozwolone tylko JSON (application/json)")
-
     if not file.filename.endswith(".json"):
         raise HTTPException(status_code=415, detail="Dozwolone są tylko pliki .json")
 
@@ -618,7 +814,6 @@ async def admin_upload_index(file: UploadFile = File(...), request: Request = No
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload nieudany: {e}")
 
-# Admin: CRON – odśwież biuletyn (ISAP/RCL/MEN + Infor)
 @app.post("/admin/refresh-public-sources")
 async def refresh_public_sources(request: Request):
     if not ADMIN_KEY or request.headers.get("X-APO-Key") != ADMIN_KEY:
@@ -630,7 +825,17 @@ async def refresh_public_sources(request: Request):
     Path(BULLETIN_PATH).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"ok": True, "items": len(payload.get("items", [])), "updated": payload.get("updated_at")}
 
-# DEV entrypoint
+@app.post("/admin/reload-denylist")
+async def admin_reload_denylist(request: Request):
+    if not ADMIN_KEY or request.headers.get("X-APO-Key") != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    _load_denylist()
+    return {"ok": True, "patterns": len(_DENY_REGEXES)}
+
+
+# ==============================================================================
+# DEV ENTRYPOINT
+# ==============================================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)

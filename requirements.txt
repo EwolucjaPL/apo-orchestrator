@@ -1,15 +1,19 @@
-fastapi>=0.111,<0.116
-uvicorn[standard]>=0.23,<0.32
-pydantic>=2.7,<3
-python-dotenv>=1.0,<2
-openai>=1.30,<2
-httpx>=0.27,<0.29          # możesz wykorzystać do przyszłych zapytań HTTP
-orjson>=3.10,<4            # szybki serializer JSON (FastAPI fallback)
-numpy>=1.26,<2             # potrzebne tylko jeśli planujesz analizy numeryczne
-scikit-learn>=1.5,<2       # np. przyszłe modele ML w RAG
-rank-bm25>=0.2,<0.3        # lepsze wyszukiwanie w RAG
-tqdm>=4.66,<5              # wygodne progress-bary (przydatne przy trenowaniu/offline)
-python-multipart>=0.0.9,<0.1  # obsługa uploadów (np. admin/upload-index)
-requests>=2.32.0
-beautifulsoup4>=4.12.2
-starlette>=0.37.2,<0.41
+fastapi>=0.111,<0.116            # API framework (zgodny ze Starlette <0.41)
+starlette>=0.37.2,<0.41          # wymagane dla ProxyHeadersMiddleware (stabilny import)
+
+uvicorn[standard]>=0.23,<0.32    # serwer ASGI (standard = uvloop, httptools itp.)
+orjson>=3.10,<4                  # szybki serializer JSON (używany przez FastAPI)
+
+pydantic>=2.7,<3                 # walidacja modeli (v2)
+python-dotenv>=1.0,<2            # obsługa .env
+openai>=1.30,<2                  # klient OpenAI/OpenRouter (AsyncOpenAI)
+httpx>=0.27,<0.29                # klient HTTP (zgodny z openai>=1.30)
+
+python-multipart>=0.0.9,<0.1     # upload plików (admin/upload-index)
+requests>=2.32.0                 # pomocniczo (np. w public_sources)
+beautifulsoup4>=4.12.2           # parser HTML (public_sources)
+
+rank-bm25>=0.2,<0.3              # lepsze wyszukiwanie w RAG (opcjonalny boost)
+numpy>=1.26,<2                   # akceleratory numeryczne (opcjonalnie)
+scikit-learn>=1.5,<2             # potencjalne modele/analizy offline (opcjonalnie)
+tqdm>=4.66,<5                    # progress-bary przy zadaniach offline
