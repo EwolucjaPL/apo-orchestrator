@@ -11,7 +11,14 @@ from fastapi import FastAPI, HTTPException, Query, Response, Request, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
-from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
+# --- ProxyHeadersMiddleware z bezpiecznym fallbackiem ---
+try:
+    from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
+    _PROXY_HEADERS_AVAILABLE = True
+except Exception:
+    ProxyHeadersMiddleware = None  # type: ignore
+    _PROXY_HEADERS_AVAILABLE = False
+
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -60,8 +67,9 @@ app.add_middleware(
 )
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
-# Proxy headers (prawdziwe IP z X-Forwarded-For)
-app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+# Proxy headers (prawdziwe IP z X-Forwarded-For), tylko gdy dostępne
+if _PROXY_HEADERS_AVAILABLE:
+    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 # Prosty rate-limit per IP (in-memory; dla 1 procesu)
 RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
@@ -96,7 +104,7 @@ async def request_context(request: Request, call_next):
         cutoff = now - 60
         while bucket and bucket[0] < cutoff:
             bucket.pop(0)
-        if len(bucket) >= RATE_LIMIT_RPM and request.url.path not in ("/health", "/live", "/ready"):
+        if len(bucket) >= RATE_LIMIT_RPM and request.url.path not in ("/health", "/live", "/ready", "/"):
             return ORJSONResponse(
                 {"detail": "Rate limit exceeded. Try again later."},
                 status_code=429,
@@ -325,7 +333,6 @@ async def llm_call(prompt: str, model: str = LLM_DEFAULT_MODEL, timeout: float =
                 raise HTTPException(status_code=504, detail="Timeout podczas wywołania modelu AI")
         except Exception as e:
             if i == 1:
-                # mapuj częstsze stany na sensowne kody, reszta -> 502
                 msg = str(e)
                 if "429" in msg:
                     raise HTTPException(status_code=429, detail="OpenAI rate limit")
@@ -352,6 +359,18 @@ def _all_components_empty(req: "SynthesisRequest") -> bool:
 # --------------------------------------------------------------------------------------
 # ENDPOINTY API
 # --------------------------------------------------------------------------------------
+@app.get("/")
+def root():
+    return {
+        "name": "APO Gateway",
+        "status": "ok",
+        "docs": "/docs",
+        "redoc": "/redoc",
+        "health": "/health",
+        "ready": "/ready",
+        "live": "/live"
+    }
+
 @app.get("/live")
 def liveness() -> Dict[str, Any]:
     return {"status": "alive"}
