@@ -6,11 +6,20 @@ services:
     autoDeploy: true
 
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
 
+    # Auto-init plików na dysku + start serwera
+    startCommand: >
+      bash -lc '
+      mkdir -p /var/apo;
+      [ -f "/var/apo/bulletin.json" ] || printf "{\n  \"items\": [],\n  \"updated_at\": null\n}\n" > /var/apo/bulletin.json;
+      [ -f "/var/apo/denylist.json" ] || printf "{\n  \"patterns\": []\n}\n" > /var/apo/denylist.json;
+      uvicorn main:app --host 0.0.0.0 --port $PORT
+      '
+
+    # MOUNT: /var/apo (zamiast /data)
     disk:
       name: apo-data
-      mountPath: /data
+      mountPath: /var/apo
       sizeGB: 1
 
     envVars:
@@ -19,9 +28,9 @@ services:
       - key: APO_ADMIN_KEY
         sync: false
       - key: BULLETIN_PATH
-        value: /data/bulletin.json
+        value: /var/apo/bulletin.json
       - key: APO_KB_DENYLIST_PATH
-        value: /data/denylist.json
+        value: /var/apo/denylist.json
       - key: KNOWLEDGE_INDEX_PATH
         value: index.json
       - key: LLM_DEFAULT_MODEL
