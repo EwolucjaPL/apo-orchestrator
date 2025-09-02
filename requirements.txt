@@ -1,12 +1,12 @@
-fastapi
-uvicorn[standard]
-pydantic
-python-dotenv
-openai
-httpx
-orjson
-numpy
-scikit-learn
-rank-bm25
-tqdm
-python-multipart
+fastapi>=0.111,<0.116
+uvicorn[standard]>=0.23,<0.32
+pydantic>=2.7,<3
+python-dotenv>=1.0,<2
+openai>=1.30,<2
+httpx>=0.27,<0.29          # możesz wykorzystać do przyszłych zapytań HTTP
+orjson>=3.10,<4            # szybki serializer JSON (FastAPI fallback)
+numpy>=1.26,<2             # potrzebne tylko jeśli planujesz analizy numeryczne
+scikit-learn>=1.5,<2       # np. przyszłe modele ML w RAG
+rank-bm25>=0.2,<0.3        # lepsze wyszukiwanie w RAG
+tqdm>=4.66,<5              # wygodne progress-bary (przydatne przy trenowaniu/offline)
+python-multipart>=0.0.9,<0.1  # obsługa uploadów (np. admin/upload-index)
