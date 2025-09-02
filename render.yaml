@@ -2,7 +2,7 @@ services:
   - type: web
     name: apo-orchestrator-1
     env: python
-    plan: starter   # dostosuj wg potrzeb
+    plan: starter
     autoDeploy: true
 
     buildCommand: pip install -r requirements.txt
@@ -10,8 +10,8 @@ services:
 
     disk:
       name: apo-data
-      mountPath: /var/apo
-      sizeGB: 1   # zwykle wystarczy 1–2 GB na biuletyn + logi
+      mountPath: /data
+      sizeGB: 1
 
     envVars:
       - key: OPENROUTER_API_KEY
@@ -19,7 +19,9 @@ services:
       - key: APO_ADMIN_KEY
         sync: false
       - key: BULLETIN_PATH
-        value: /var/apo/bulletin.json
+        value: /data/bulletin.json
+      - key: APO_KB_DENYLIST_PATH
+        value: /data/denylist.json
       - key: KNOWLEDGE_INDEX_PATH
         value: index.json
       - key: LLM_DEFAULT_MODEL
