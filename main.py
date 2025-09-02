@@ -6,7 +6,6 @@ import uuid
 from time import monotonic
 from collections import Counter
 from typing import List, Optional, Dict, Any, Tuple
-
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,7 +13,6 @@ from fastapi import FastAPI, HTTPException, Query, Response, Request, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
-# ProxyHeaders z ostrożnym fallbackiem (nie blokuj startu, gdy brak modułu)
 try:
     from starlette.middleware.proxy_headers import ProxyHeadersMiddleware
     _PROXY_HEADERS_AVAILABLE = True
@@ -34,9 +32,10 @@ except Exception:
     ORJSONResponse = JSONResponse  # fallback
     _ORJSON = False
 
-# --------------------------------------------------------------------------------------
+
+# ======================================================================================
 # KONFIGURACJA
-# --------------------------------------------------------------------------------------
+# ======================================================================================
 load_dotenv()
 
 APP_TITLE = "APO Gateway"
@@ -104,7 +103,7 @@ async def request_context(request: Request, call_next):
         cutoff = now - 60
         while bucket and bucket[0] < cutoff:
             bucket.pop(0)
-        # /health, /ready, /live i / to białe listy
+        # biała lista
         if len(bucket) >= RATE_LIMIT_RPM and request.url.path not in ("/health", "/ready", "/live", "/"):
             return ORJSONResponse(
                 {"detail": "Rate limit exceeded. Try again later."},
@@ -136,9 +135,10 @@ async def unhandled_exc_handler(request: Request, exc: Exception):
     rid = request.headers.get("X-Request-Id") or _make_request_id()
     return ORJSONResponse({"detail": "Internal server error"}, status_code=500, headers={"X-Request-Id": rid})
 
-# --------------------------------------------------------------------------------------
+
+# ======================================================================================
 # PROMPTY
-# --------------------------------------------------------------------------------------
+# ======================================================================================
 PROMPT_KATEGORYZACJA = (
     "Your only task is to assess if the following query is exclusively about Polish educational law. "
     "Your domain includes: Teacher's Charter, school management, student rights, pedagogical supervision. "
@@ -153,7 +153,7 @@ PROMPT_ANALIZA_ZAPYTANIA = (
     "Respond ONLY with valid JSON, no explanations.\n\nQuery: \"{query}\""
 )
 
-# 9-sekcyjny format + zakaz ujawniania wewnętrznej KB + większe odstępy
+# 9-sekcyjny format + nieujawnianie wewnętrznej KB + większe odstępy
 PROMPT_SYNTEZA_ODPOWIEDZI = (
     "You are Asystent Prawa Oświatowego. Assemble the verified components into a single, "
     "coherent, professional, and crystal-clear answer in Polish for school leaders. "
@@ -161,7 +161,7 @@ PROMPT_SYNTEZA_ODPOWIEDZI = (
     "Never include meta-notes or code blocks; do not reveal internal IDs.\n\n"
     "SEKCJE (W TEJ KOLEJNOŚCI):\n"
     "1) **Weryfikacja pytania** – jedno zdanie parafrazy pytania użytkownika.\n"
-    "2) **Komunikat weryfikacji** – linia zaczynająca się od ✅ i krótkie potwierdzenie zakresu odpowiedzi.\n"
+    "2) **Komunikat weryfikacji** – linia zaczynająca się od ✅ i krótkie potwierdzenie ZAKRESU pytania (neutralne; NIE podawaj jeszcze rozstrzygnięcia!).\n"
     "3) **Podstawa prawna ⚖️** – lista punktowana artykułów/aktów; zakończ wierszem:\n"
     "   Stan prawny: [data] (jeśli brak danych w komponentach, wpisz: {stan_prawny_domyslny} (domyślny)).\n"
     "4) **Interpretacja prawna 💡** – 2–3 krótkie akapity wyjaśniające sens i wyjątki.\n"
@@ -172,7 +172,7 @@ PROMPT_SYNTEZA_ODPOWIEDZI = (
     "9) **Dodatkowa oferta wsparcia 🤝** – pytanie otwierające.\n\n"
     "FORMATOWANIE (OBOWIĄZKOWE):\n"
     "- Przed KAŻDĄ sekcją wstaw poziomą linię: ---\n"
-    "- Dodaj DWIE puste linie między sekcjami (po treści sekcji zostaw dwie puste linie), aby poprawić czytelność.\n"
+    "- Po treści każdej sekcji zostaw DWA puste wiersze (dla czytelności).\n"
     "- Nie używaj nagłówków #/##/###; sekcje pisz jako wytłuszczone tytuły (**) + tekst pod spodem.\n"
     "- W **Podstawa prawna ⚖️** użyj punktorów (–) z pełnymi nazwami aktów i artykułów.\n"
     "- W **Odpowiedź wprost 🎯**: całe zdanie wytłuszczone i w osobnym akapicie.\n"
@@ -187,9 +187,9 @@ PROMPT_SYNTEZA_ODPOWIEDZI = (
     "- Pisz krótko, jasno, zorientowanie na dyrektorów szkół.\n"
 )
 
-# --------------------------------------------------------------------------------------
+# ======================================================================================
 # MODELE
-# --------------------------------------------------------------------------------------
+# ======================================================================================
 class QueryRequest(BaseModel):
     query: str = Field(..., min_length=3, max_length=MAX_QUERY_CHARS)
 
@@ -209,13 +209,15 @@ class SearchHit(BaseModel):
     score: float
     snippet: str
 
-# --------------------------------------------------------------------------------------
+
+# ======================================================================================
 # MINI-RAG (opcjonalnie BM25)
-# --------------------------------------------------------------------------------------
+# ======================================================================================
 IndexEntry = Dict[str, Any]
 _INDEX_METADATA: Dict[str, Any] = {}
 _ENTRIES: List[IndexEntry] = []
 _BM25 = None
+
 try:
     from rank_bm25 import BM25Okapi  # type: ignore
     _BM25_AVAILABLE = True
@@ -271,7 +273,6 @@ _load_index(KNOWLEDGE_INDEX_PATH)
 def _score_entry_tf(query_tokens: List[str], entry: IndexEntry) -> float:
     if not query_tokens:
         return 0.0
-    from collections import Counter
     cnt = Counter(entry.get("_tokens", []))
     score = sum(cnt[tok] for tok in query_tokens)
     title = entry.get("_title_norm", "")
@@ -311,9 +312,10 @@ def search_entries(query: str, k: int = 5) -> List[SearchHit]:
         )
     return hits
 
-# --------------------------------------------------------------------------------------
+
+# ======================================================================================
 # LLM (z retry)
-# --------------------------------------------------------------------------------------
+# ======================================================================================
 async def llm_call(prompt: str, model: str = LLM_DEFAULT_MODEL, timeout: float = 30.0) -> str:
     async def _once() -> str:
         client = get_client()
@@ -354,9 +356,10 @@ def _all_components_empty(req: "SynthesisRequest") -> bool:
         return (x is None) or (isinstance(x, str) and len(x.strip()) == 0)
     return _empty(req.analiza_prawna) and _empty(req.wynik_weryfikacji) and _empty(req.biuletyn_informacyjny)
 
-# --------------------------------------------------------------------------------------
+
+# ======================================================================================
 # Polityka: nie ujawniamy składu KB (wykrywanie metapytania)
-# --------------------------------------------------------------------------------------
+# ======================================================================================
 _KB_META_PATTERNS = [
     r"\bbaza wiedzy\b",
     r"\bspis treści\b", r"\bspis tresci\b",
@@ -374,9 +377,10 @@ def _is_kb_meta_query(text: str) -> bool:
             return True
     return False
 
-# --------------------------------------------------------------------------------------
+
+# ======================================================================================
 # BIULETYN: wczytywanie lokalnego feedu i endpoint do CRON-a
-# --------------------------------------------------------------------------------------
+# ======================================================================================
 def _load_bulletin_text() -> str:
     p = Path(BULLETIN_PATH)
     if not p.exists():
@@ -412,9 +416,68 @@ try:
 except Exception:
     refresh_all_sources = None  # brak – endpoint zwróci 501
 
-# --------------------------------------------------------------------------------------
+
+# ======================================================================================
+# POMOCNICZE: gotowe wiadomości w 9-sekcyjnym formacie
+# ======================================================================================
+def _md_block_separator() -> str:
+    return "---\n"
+
+def _two_blank_lines() -> str:
+    return "\n\n"
+
+def _refusal_markdown() -> str:
+    """Ujednolicona odmowa (poza domeną) w tym samym układzie 9 sekcji."""
+    parts = []
+    parts.append(_md_block_separator() + "**Weryfikacja pytania**\nTo pytanie nie dotyczy polskiego prawa oświatowego.")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Komunikat weryfikacji**\n✅ Pytanie wykracza poza zakres Asystenta Prawa Oświatowego (prawo oświatowe).")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Podstawa prawna ⚖️**\n– (brak danych)\nStan prawny: " + LEGAL_STATUS_DEFAULT_DATE + " (domyślny).")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Interpretacja prawna 💡**\nAsystent Prawa Oświatowego udziela informacji wyłącznie w obszarze prawa oświatowego (Karta Nauczyciela, Prawo oświatowe, akty MEN). Pytania z zakresu podatków, ubezpieczeń, prawa cywilnego czy gospodarczego nie są obsługiwane.")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Procedura krok po kroku 📝**\n1. Sformułuj pytanie dotyczące prawa oświatowego.\n2. Jeśli chodzi o inną dziedzinę (np. VAT), skonsultuj się ze specjalistą w danej dziedzinie.\n3. Podaj kontekst (typ szkoły, etap edukacyjny), aby uzyskać precyzyjniejszą odpowiedź.")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Odpowiedź wprost 🎯**\n**Nie – nie odpowiadam na pytania spoza domeny prawa oświatowego.**")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Proaktywna sugestia 💡**\nRozważ zadanie pytania dotyczącego Karty Nauczyciela, obowiązków dyrektora, organizacji pracy szkoły lub uprawnień uczniów.")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Disclaimer prawny ⚖️**\nOdpowiedź ma charakter ogólny i dotyczy wyłącznie prawa oświatowego. Stan prawny: " + LEGAL_STATUS_DEFAULT_DATE + ".")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Dodatkowa oferta wsparcia 🤝**\nCzy chcesz, abym pomógł przeformułować pytanie tak, aby dotyczyło prawa oświatowego?")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Źródła**\n– (brak – pytanie spoza domeny)")
+    return "".join(parts)
+
+def _kb_scope_markdown() -> str:
+    """Ujednolicona odpowiedź na meta-pytanie o bazę (zakres, bez ujawniania składu)."""
+    parts = []
+    parts.append(_md_block_separator() + "**Weryfikacja pytania**\nProśba o przedstawienie bazy wiedzy i źródeł.")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Komunikat weryfikacji**\n✅ Pytanie dotyczy zakresu tematycznego i rodzaju źródeł wykorzystywanych przez APO.")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Podstawa prawna ⚖️**\n– Karta Nauczyciela (ustawa z 26 stycznia 1982 r.)\n– Prawo oświatowe (ustawa z 14 grudnia 2016 r.)\n– Wybrane rozporządzenia MEN\n– Orzecznictwo oraz oficjalne komunikaty organów administracji\nStan prawny: " + LEGAL_STATUS_DEFAULT_DATE + " (domyślny).")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Interpretacja prawna 💡**\nAPO udziela odpowiedzi wyłącznie w obszarze polskiego prawa oświatowego. W odpowiedziach cytowane są wyłącznie publicznie dostępne akty i dokumenty. Skład wewnętrznych materiałów pomocniczych nie jest ujawniany.")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Procedura krok po kroku 📝**\n1. Podaj konkretne zagadnienie (np. artykuł KN, statut szkoły, arkusz).\n2. Otrzymasz analizę wraz z podstawą prawną i krótką procedurą.\n3. W razie potrzeby doprecyzuj kontekst (typ szkoły, etap, rola pytającego).")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Odpowiedź wprost 🎯**\n**APO przedstawia jedynie ogólny zakres źródeł (akty publiczne) i nie ujawnia składu wewnętrznej bazy wiedzy.**")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Proaktywna sugestia 💡**\nPodaj proszę konkretne pytanie z obszaru prawa oświatowego; przygotuję zwięzłą analizę z podstawą prawną.")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Disclaimer prawny ⚖️**\nOdpowiedź ma charakter ogólny i dotyczy zakresu tematycznego. Stan prawny: " + LEGAL_STATUS_DEFAULT_DATE + ".")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Dodatkowa oferta wsparcia 🤝**\nCzy chcesz, abym zaproponował katalog przykładowych tematów (dyrektor, rada pedagogiczna, KN, statut)?")
+    parts.append(_two_blank_lines())
+    parts.append(_md_block_separator() + "**Źródła**\n– ISAP (akty prawne)\n– Dziennik Ustaw / RCL\n– MEN – komunikaty i rozporządzenia")
+    return "".join(parts)
+
+
+# ======================================================================================
 # ENDPOINTY
-# --------------------------------------------------------------------------------------
+# ======================================================================================
 @app.get("/")
 def root():
     return {
@@ -493,31 +556,13 @@ async def knowledge_search(q: str = Query(..., min_length=2), k: int = Query(MAX
 
 @app.post("/gate-and-format-response")
 async def gate_and_format_response(request: SynthesisRequest):
-    # Poza domeną
+    # Poza domeną → ujednolicona odmowa w 9 sekcjach (markdown)
     if request.analiza_prawna == "ODRZUCONE_SPOZA_DOMENY":
-        final_md = (
-            "Dziękuję za Twoje pytanie. Nazywam się Asystent Prawa Oświatowego, a moja wiedza "
-            "jest ograniczona wyłącznie do zagadnień polskiego prawa oświatowego. Twoje pytanie "
-            "wykracza poza ten zakres – nie mogę udzielić informacji na ten temat."
-        )
-        return Response(content=final_md, media_type="text/markdown; charset=utf-8")
+        return Response(content=_refusal_markdown(), media_type="text/markdown; charset=utf-8")
 
-    # Meta-pytanie o KB → zakres bez ujawniania składu
+    # Meta-pytanie o KB → ujednolicona odpowiedź w 9 sekcjach (zakres, bez składu)
     if request.analiza_prawna == "META_KB_SCOPE_ONLY":
-        final_md = (
-            "---\n"
-            "**Zakres wsparcia APO (bez ujawniania wewnętrznej bazy)**\n"
-            "APO udziela odpowiedzi wyłącznie w obszarze polskiego prawa oświatowego, w tym m.in.: "
-            "Karta Nauczyciela, Prawo oświatowe, wybrane rozporządzenia MEN, oficjalne komunikaty i orzecznictwo. "
-            "Nie ujawniamy składu ani listy wewnętrznych materiałów źródłowych.\n\n"
-            "---\n"
-            "**Jak mogę pomóc?**\n"
-            "Podaj proszę konkretne zagadnienie (np. artykuł, temat lub problem praktyczny), a przygotuję zwięzłą analizę z podstawą prawną.\n\n"
-            "---\n"
-            "**Uwaga**\n"
-            "W odpowiedziach cytujemy wyłącznie publicznie dostępne akty prawne i oficjalne dokumenty; nie podajemy tytułów prywatnych opracowań."
-        )
-        return Response(content=final_md, media_type="text/markdown; charset=utf-8")
+        return Response(content=_kb_scope_markdown(), media_type="text/markdown; charset=utf-8")
 
     # Brak treści
     if _all_components_empty(request):
@@ -525,6 +570,7 @@ async def gate_and_format_response(request: SynthesisRequest):
 
     analiza = sanitize_component(request.analiza_prawna)
     wery = sanitize_component(request.wynik_weryfikacji)
+    # Jeśli brak biuletynu w komponencie – domyślnie dociągnij lokalny bulletin.json (CRON)
     biul = sanitize_component(request.biuletyn_informacyjny) or _load_bulletin_text()
 
     prompt = PROMPT_SYNTEZA_ODPOWIEDZI.format(
