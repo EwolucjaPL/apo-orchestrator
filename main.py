@@ -157,7 +157,7 @@ PROMPT_ANALIZA_ZAPYTANIA = (
     "Respond ONLY with valid JSON, no explanations.\n\nQuery: \"{query}\""
 )
 
-# --- NOWY, CZYTELNY SCHEMAT 9-SEKCYJNEJ ODPOWIEDZI ---
+# --- NOWY, CZYTELNY SCHEMAT 9-SEKCYJNEJ ODPOWIEDZI z odstępami i liniami poziomymi ---
 PROMPT_SYNTEZA_ODPOWIEDZI = (
     "You are Asystent Prawa Oświatowego. Assemble the verified components into a single, "
     "coherent, professional, and crystal-clear answer in Polish for school leaders. "
@@ -175,11 +175,13 @@ PROMPT_SYNTEZA_ODPOWIEDZI = (
     "8) **Disclaimer prawny ⚖️** – standard: odpowiedź ogólna, nie jest poradą prawną; podaj stan prawny.\n"
     "9) **Dodatkowa oferta wsparcia 🤝** – pytanie otwierające do dalszego działania.\n\n"
     "FORMATOWANIE (OBOWIĄZKOWE):\n"
+    "- Przed KAŻDĄ sekcją wstaw poziomą linię: ---\n"
+    "- Dodaj DWIE puste linie między sekcjami (po treści sekcji zostaw dwie puste linie).\n"
     "- Nie używaj nagłówków #, ##, ###! Sekcje pisz jako wytłuszczone tytuły (**) + tekst pod spodem.\n"
     "- W **Podstawa prawna ⚖️**: użyj punktorów (–) z pełnymi nazwami aktów i artykułów (np. „Karta Nauczyciela, art. 20 ust. 1 pkt 2 (Dz.U. 2023 poz. 984)”).\n"
-    "- W **Procedura krok po kroku 📝**: numerowana lista 1., 2., 3.\n"
-    "- W **Odpowiedź wprost 🎯**: całe zdanie pogrubione.\n"
-    "- Na końcu dodaj **Źródła:** jako zwykłą listę punktowaną z pełnymi opisami (akty prawne, komentarze, dokumenty oficjalne). "
+    "- W **Procedura krok po kroku 📝**: numerowana lista 1., 2., 3. i zostaw pustą linię między punktami.\n"
+    "- W **Odpowiedź wprost 🎯**: całe zdanie pogrubione i w osobnym akapicie.\n"
+    "- Na końcu dodaj **Źródła** oddzielone poziomą linią i wypisz pełne opisy (akty prawne, komentarze). "
     "Jeśli komponenty nie dostarczyły źródeł, wypisz tylko akty oczywiste z treści; nigdy nie pokazuj wewnętrznych identyfikatorów.\n\n"
     "== KOMPONENTY DO UŻYCIA ==\n"
     "[Analiza prawna]\n{analiza_prawna}\n\n"
@@ -290,7 +292,9 @@ def search_entries(query: str, k: int = 5) -> List[SearchHit]:
 
     if _BM25_AVAILABLE and _BM25 is not None:
         scores = _BM25.get_scores(q_tokens)
-        ranked = sorted(zip(scores, _ENTRIES), key=lambda x: x[0], reverse=True)[:k]
+        # BM25 zwraca listę floatów w tej samej kolejności co _ENTRIES
+        ranked_pairs: List[Tuple[float, IndexEntry]] = list(zip(map(float, scores), _ENTRIES))
+        ranked = sorted(ranked_pairs, key=lambda x: x[0], reverse=True)[:k]
     else:
         scored: List[Tuple[float, IndexEntry]] = []
         for e in _ENTRIES:
@@ -308,7 +312,7 @@ def search_entries(query: str, k: int = 5) -> List[SearchHit]:
                 title=e.get("title", ""),
                 book=e.get("book"),
                 chapter=e.get("chapter"),
-                score=float(s if isinstance(s, (int, float)) else s[0]),
+                score=float(s),
                 snippet=snippet,
             )
         )
