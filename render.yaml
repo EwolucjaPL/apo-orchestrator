@@ -1,0 +1,106 @@
+services:
+  - type: web
+    name: apo-orchestrator-1
+    env: python
+    plan: starter
+    autoDeploy: true
+
+    buildCommand: pip install -r requirements.txt
+
+    startCommand: >
+      bash -lc '
+      set -euo pipefail
+      SRC="/opt/render/project/src"
+      PD_BASE="/var/apo"
+      PD_REPO="$PD_BASE/repo"
+      PD_DATA="$PD_BASE/data"
+      mkdir -p "$PD_REPO" "$PD_DATA"
+
+      # Mirror całego repo na Persistent Disk (bez .git), usuwając pliki usunięte w repo
+      rsync -a --delete --exclude=".git" "$SRC/" "$PD_REPO/"
+
+      # Zapis commita (Render udostępnia RENDER_GIT_COMMIT)
+      if [ -n "${RENDER_GIT_COMMIT:-}" ]; then
+        echo "$RENDER_GIT_COMMIT" > "$PD_BASE/.synced_commit"
+      fi
+
+      # Inicjalizacja plików dynamicznych (jeśli ich brak)
+      [ -f "$PD_DATA/bulletin.json" ] || echo "{\"items\":[],\"updated_at\":null}" > "$PD_DATA/bulletin.json"
+      [ -f "$PD_DATA/denylist.json" ] || echo "{\"patterns\":[]}" > "$PD_DATA/denylist.json"
+      [ -f "$PD_DATA/index.json" ] || echo "{\"metadata\":{},\"entries\":[]}" > "$PD_DATA/index.json"
+
+      # Start aplikacji
+      uvicorn main:app --host 0.0.0.0 --port $PORT
+      '
+
+    disk:
+      name: apo-data
+      mountPath: /var/apo
+      sizeGB: 1
+
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: APO_ADMIN_KEY
+        sync: false
+
+      # Ścieżki dynamiczne (PD)
+      - key: KNOWLEDGE_INDEX_PATH
+        value: /var/apo/data/index.json
+      - key: BULLETIN_PATH
+        value: /var/apo/data/bulletin.json
+      - key: APO_KB_DENYLIST_PATH
+        value: /var/apo/data/denylist.json
+
+      # Ścieżki do mirroru repo (PD)
+      - key: KB_DIR
+        value: /var/apo/repo/kb
+      - key: INSTRUCTIONS_DIR
+        value: /var/apo/repo/instructions
+
+      # Konfiguracja modeli i API
+      - key: LLM_DEFAULT_MODEL
+        value: openai/gpt-4o
+      - key: LLM_PLANNER_MODEL
+        value: mistralai/mistral-7b-instruct:free
+
+      # Rate-limit i meta
+      - key: RATE_LIMIT_ENABLED
+        value: "true"
+      - key: RATE_LIMIT_RPM
+        value: "120"
+      - key: LEGAL_STATUS_DEFAULT_DATE
+        value: "1 września 2025 r."
+      - key: PUBLIC_BASE_URL
+        value: https://apo-orchestrator-1.onrender.com
+
+schedules:
+  - name: refresh-public-sources-morning
+    type: cron
+    schedule: "0 6 * * *"
+    env: python
+    plan: starter
+    command: >
+      bash -lc
+      "curl -fsS -X POST -H \"X-APO-Key: $APO_ADMIN_KEY\" \
+      \"$PUBLIC_BASE_URL/admin/refresh-public-sources\" || true"
+
+  - name: refresh-public-sources-evening
+    type: cron
+    schedule: "0 18 * * *"
+    env: python
+    plan: starter
+    command: >
+      bash -lc
+      "curl -fsS -X POST -H \"X-APO-Key: $APO_ADMIN_KEY\" \
+      \"$PUBLIC_BASE_URL/admin/refresh-public-sources\" || true"
+
+  - name: refresh-public-sources-weekly
+    type: cron
+    schedule: "30 21 * * 0"
+    env: python
+    plan: starter
+    command: >
+      bash -lc
+      "curl -fsS -X POST -H \"X-APO-Key: $APO_ADMIN_KEY\" \
+      \"$PUBLIC_BASE_URL/admin/refresh-public-sources\" || true"
