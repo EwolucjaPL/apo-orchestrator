@@ -1,19 +1,18 @@
 import os
 import re
 import json
+import time
 import asyncio
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Request
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Request, Header
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, ValidationError
 from dotenv import load_dotenv
-
-# OpenRouter (Async)
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI  # OpenRouter (Async)
 
 # --------------------------------------------------------------------------------------
 # KONFIGURACJA / ENV
@@ -24,6 +23,7 @@ APP_TITLE = "APO Gateway"
 APP_DESC = "Gateway + mini-RAG dla prawa oświatowego (APO)"
 app = FastAPI(title=APP_TITLE, description=APP_DESC)
 
+# Klucze / modele
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 if not OPENROUTER_API_KEY:
     raise RuntimeError("Brak OPENROUTER_API_KEY w środowisku")
@@ -31,17 +31,25 @@ if not OPENROUTER_API_KEY:
 LLM_DEFAULT_MODEL = os.getenv("LLM_DEFAULT_MODEL", "openai/gpt-4o")
 LLM_PLANNER_MODEL = os.getenv("LLM_PLANNER_MODEL", "mistralai/mistral-7b-instruct:free")
 
-KNOWLEDGE_INDEX_PATH = os.getenv("KNOWLEDGE_INDEX_PATH", "index.json")
-BULLETIN_PATH = os.getenv("BULLETIN_PATH", "/var/apo/bulletin.json")
-DENYLIST_PATH = os.getenv("APO_KB_DENYLIST_PATH", "/var/apo/denylist.json")
+# Ścieżki – domyślnie na Persistent Disk
+KNOWLEDGE_INDEX_PATH = os.getenv("KNOWLEDGE_INDEX_PATH", "/var/apo/data/index.json")
+BULLETIN_PATH = os.getenv("BULLETIN_PATH", "/var/apo/data/bulletin.json")
+DENYLIST_PATH = os.getenv("APO_KB_DENYLIST_PATH", "/var/apo/data/denylist.json")
 
+# Mirror repo (kopiowane przez render.yaml na /var/apo/repo)
+KB_DIR = os.getenv("KB_DIR", "/var/apo/repo/kb")
+INSTRUCTIONS_DIR = os.getenv("INSTRUCTIONS_DIR", "/var/apo/repo/instructions")
+
+# Inne ENV
 LEGAL_STATUS_DEFAULT_DATE = os.getenv("LEGAL_STATUS_DEFAULT_DATE", "1 września 2025 r.")
 RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
 RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "120"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://0.0.0.0:8000")
-
 ADMIN_KEY = os.getenv("APO_ADMIN_KEY")
 ALLOW_UPLOADS = os.getenv("ALLOW_UPLOADS", "false").lower() == "true"
+
+# Commit mirrora (zapisuje go startCommand w render.yaml, jeśli RENDER_GIT_COMMIT jest dostępny)
+SYNCED_COMMIT_PATH = "/var/apo/.synced_commit"
 
 # --------------------------------------------------------------------------------------
 # KLIENT LLM (OpenRouter)
@@ -93,8 +101,8 @@ PROMPT_ANALIZA_ZAPYTANIA = (
 # 9-sekcyjny szkielet odpowiedzi — edytor scali komponenty do czytelnego Markdown
 PROMPT_SYNTEZA_ODPOWIEDZI = (
     "Jesteś redaktorem w kancelarii prawa oświatowego. ZŁÓŻ spójny, bardzo czytelny Markdown "
-    "z sekcjami i odstępami. Użyj poniższego schematu i uzupełnij danymi z komponentów. "
-    "Język: polski.\n\n"
+    "z wyraźnymi nagłówkami i **dużymi odstępami między sekcjami**. Użyj poniższego schematu "
+    "i uzupełnij danymi z komponentów. Język: polski.\n\n"
     "=== KOMPONENTY ===\n"
     "[Analiza prawna]\n{analiza_prawna}\n\n"
     "[Weryfikacja cytatu]\n{wynik_weryfikacji}\n\n"
@@ -111,7 +119,6 @@ PROMPT_SYNTEZA_ODPOWIEDZI = (
     "7) **Proaktywna sugestia 💡** — 2–3 praktyczne wskazówki.\n"
     "8) **Disclaimer prawny ⚖️** — formuła ogólna, z datą stanu prawnego.\n"
     "9) **Źródła** — wypunktuj; jeśli brak konkretnych, wskaż 'akty prawne wskazane wyżej'.\n"
-    "Dbaj o **czytelne odstępy między sekcjami** (puste linie) i nagłówki.\n"
 )
 
 # --------------------------------------------------------------------------------------
@@ -188,7 +195,7 @@ def _load_denylist(path: str) -> None:
 
 
 def _deny_match(title: str) -> bool:
-    """True jeśli tytuł trafia w denylistę (prosty wildcard '*')."""
+    """True jeśli tytuł trafia w denylistę (prosty contains – w razie potrzeby rozbuduj do fnmatch)."""
     t = title.lower()
     for pat in _DENY_PATTERNS:
         p = pat.lower().strip()
@@ -196,7 +203,6 @@ def _deny_match(title: str) -> bool:
             continue
         if p == "*":
             return True
-        # prosty 'contains' (w razie potrzeby rozbudować do fnmatch)
         if p in t:
             return True
     return False
@@ -224,7 +230,7 @@ def search_entries(query: str, k: int = 5) -> List[SearchHit]:
     scored.sort(key=lambda x: x[0], reverse=True)
 
     hits: List[SearchHit] = []
-    for s, e in scored[: k * 2]:  # weź trochę więcej i przefiltruj denylistę
+    for s, e in scored[: k * 2]:  # bierz trochę więcej i przefiltruj denylistę
         title = e.get("title", "")
         if _deny_match(title):
             continue
@@ -259,9 +265,26 @@ def _ensure_dirs_for(path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
+def _read_synced_commit() -> Optional[str]:
+    try:
+        if os.path.exists(SYNCED_COMMIT_PATH):
+            return Path(SYNCED_COMMIT_PATH).read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return None
+
+
 # Inicjalizacja przy starcie
 _load_index(KNOWLEDGE_INDEX_PATH)
 _load_denylist(DENYLIST_PATH)
+
+# Log diagnostyczny ścieżek
+print(f"[APO] KB_DIR={KB_DIR}")
+print(f"[APO] INSTRUCTIONS_DIR={INSTRUCTIONS_DIR}")
+print(f"[APO] INDEX_PATH={KNOWLEDGE_INDEX_PATH}")
+print(f"[APO] BULLETIN_PATH={BULLETIN_PATH}")
+print(f"[APO] DENYLIST_PATH={DENYLIST_PATH}")
+print(f"[APO] SYNCED_COMMIT={_read_synced_commit() or '-'}")
 
 # --------------------------------------------------------------------------------------
 # PUBLICZNE ŹRÓDŁA: odświeżanie biuletynu (ISAP/MEN itp.)
@@ -281,19 +304,19 @@ except Exception:
             json.dump(data, f, ensure_ascii=False, indent=2)
         return {"ok": True, "items": 0, "updated_at": now}
 
-
 # --------------------------------------------------------------------------------------
 # SANITY / FILTRY
 # --------------------------------------------------------------------------------------
 def sanitize_component(text: Optional[str]) -> str:
     if not text:
         return ""
-    text = re.sub(r"```.*?```", " ", text, flags=re.S)  # usuń codefence
-    text = re.sub(r"(^|\n)\s*#{1,6}.*", " ", text)     # usuń nagłówki, które mogą się dublować
+    # usuń bloki codefence, ale nie połykaj treści między nimi
+    text = re.sub(r"```[\s\S]*?```", " ", text)
+    # usuń nagłówki markdown, by uniknąć duplikacji H1/H2
+    text = re.sub(r"(^|\n)\s*#{1,6}\s+.*", " ", text)
     # usuń role-tags
     text = text.replace("<|system|>", "").replace("<|assistant|>", "").replace("<|user|>", "")
-    return text.strip()
-
+    return re.sub(r"\s{2,}", " ", text).strip()
 
 # --------------------------------------------------------------------------------------
 # ENDPOINTY OPS
@@ -326,14 +349,13 @@ def ready() -> Dict[str, Any]:
         "kb_loaded": bool(_ENTRIES),
         "has_api_key": bool(OPENROUTER_API_KEY),
         "disk_ok": disk_ok,
+        "commit": _read_synced_commit(),
     }
 
 
 @app.get("/health")
 def health_check() -> Dict[str, Any]:
-    bulletin_path = BULLETIN_PATH
-    denylist_path = DENYLIST_PATH
-    bulletin_json = _safe_read_json(bulletin_path, {"items": [], "updated_at": None})
+    bulletin_json = _safe_read_json(BULLETIN_PATH, {"items": [], "updated_at": None})
     return {
         "status": "ok",
         "entries": len(_ENTRIES),
@@ -341,14 +363,18 @@ def health_check() -> Dict[str, Any]:
         "model_default": LLM_DEFAULT_MODEL,
         "model_planner": LLM_PLANNER_MODEL,
         "has_api_key": bool(OPENROUTER_API_KEY),
-        "bulletin_exists": os.path.exists(bulletin_path),
+        "bulletin_exists": os.path.exists(BULLETIN_PATH),
         "bulletin_items": len(bulletin_json.get("items", [])),
         "bulletin_updated_at": bulletin_json.get("updated_at"),
-        "denylist_exists": os.path.exists(denylist_path),
-        "bulletin_path": bulletin_path,
-        "denylist_path": denylist_path,
+        "denylist_exists": os.path.exists(DENYLIST_PATH),
+        "paths": {
+            "index": KNOWLEDGE_INDEX_PATH,
+            "bulletin": BULLETIN_PATH,
+            "denylist": DENYLIST_PATH,
+            "kb_dir": KB_DIR,
+            "instructions_dir": INSTRUCTIONS_DIR,
+        },
     }
-
 
 # --------------------------------------------------------------------------------------
 # GŁÓWNE AKCJE: analyze-query, knowledge/search, gate-and-format-response
@@ -380,22 +406,17 @@ async def knowledge_search(
     q: str = Query(..., min_length=2),
     k: int = Query(5, ge=1, le=10),
 ):
-    """Zwrot pasujących streszczeń z KB — bez ujawniania pozycji z denylisty."""
+    """Zwrot dopasowań z KB — bez ujawniania pozycji z denylisty."""
     return search_entries(q, k=k)
 
 
 @app.post("/gate-and-format-response")
 async def gate_and_format_response(payload: SynthesisRequest, req: Request):
     """
-    Zwraca końcową odpowiedź APO. Wspiera dwa formaty:
-    - application/json: zwraca STRING (ten sam content jako JSON string)
-    - text/markdown: zwraca tekst markdown
-    Wybór na podstawie nagłówka Accept.
+    Zwraca końcową odpowiedź APO w Markdown.
+    Jeśli nagłówek Accept zawiera 'application/json', pakujemy string do JSON.
     """
-    # BEZPIECZEŃSTWO: pytania o bazę wiedzy (neutralna odpowiedź, bez listy tytułów)
-    # Jeśli w analizie padnie meta-pytanie typu "podaj bazę wiedzy", nie dokładamy treści.
-    # (W praktyce ten filtr jest w warstwie planowania i denylisty — tu dodatkowy safety net.)
-    # Sentynel „poza domeną”
+    # Sentinel „poza domeną”
     if payload.analiza_prawna == "ODRZUCONE_SPOZA_DOMENY":
         content = (
             "### Komunikat APO\n\n"
@@ -407,6 +428,20 @@ async def gate_and_format_response(payload: SynthesisRequest, req: Request):
         if "application/json" in accept:
             return JSONResponse(content=content)
         return PlainTextResponse(content=content, media_type="text/markdown; charset=utf-8")
+
+    # Dodatkowy bezpiecznik: jeśli to metapytanie o „bazę wiedzy”, nie ujawniamy list tytułów.
+    q_lower = (payload.analiza_prawna or "").lower()
+    if any(p in q_lower for p in ["baza wiedzy", "jakie masz źródła", "podaj źródła", "podaj swoją bazę"]):
+        neutral = (
+            "### Informacja o zakresie wiedzy\n\n"
+            "Korzystam z wewnętrznej bazy materiałów i aktów prawnych dotyczących polskiego prawa oświatowego. "
+            "Nie udostępniam listy tytułów ani szczegółowych spisów treści. Mogę za to wskazać ramy prawne, "
+            "podstawowe akty i ogólny zakres tematyczny, a w odpowiedziach przywołuję odpowiednie podstawy prawne."
+        )
+        accept = (req.headers.get("accept") or "").lower()
+        if "application/json" in accept:
+            return JSONResponse(content=neutral)
+        return PlainTextResponse(content=neutral, media_type="text/markdown; charset=utf-8")
 
     analiza = sanitize_component(payload.analiza_prawna)
     wery = sanitize_component(payload.wynik_weryfikacji)
@@ -426,7 +461,6 @@ async def gate_and_format_response(payload: SynthesisRequest, req: Request):
     if "application/json" in accept:
         return JSONResponse(content=markdown)  # JSON string
     return PlainTextResponse(content=markdown, media_type="text/markdown; charset=utf-8")
-
 
 # --------------------------------------------------------------------------------------
 # ADMIN
@@ -459,6 +493,7 @@ async def admin_upload_index(file: UploadFile = File(...)):
     try:
         content = await file.read()
         data = json.loads(content.decode("utf-8"))
+        _ensure_dirs_for(KNOWLEDGE_INDEX_PATH)
         with open(KNOWLEDGE_INDEX_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         _load_index(KNOWLEDGE_INDEX_PATH)
@@ -468,8 +503,8 @@ async def admin_upload_index(file: UploadFile = File(...)):
 
 
 @app.post("/admin/reload-denylist")
-async def admin_reload_denylist(request: Request):
-    if not ADMIN_KEY or request.headers.get("X-APO-Key") != ADMIN_KEY:
+async def admin_reload_denylist(x_apo_key: str | None = Header(None)):
+    if not ADMIN_KEY or (x_apo_key or "") != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
         _load_denylist(DENYLIST_PATH)
@@ -478,37 +513,36 @@ async def admin_reload_denylist(request: Request):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
-# (opcjonalny) tester zapisu — pomocny przy diagnozie mounta
 @app.post("/admin/test-disk")
-async def admin_test_disk(request: Request):
-    if not ADMIN_KEY or request.headers.get("X-APO-Key") != ADMIN_KEY:
+def admin_test_disk(x_apo_key: str | None = Header(None)):
+    if not ADMIN_KEY or (x_apo_key or "") != ADMIN_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
         target_dir = Path(BULLETIN_PATH).parent
         target_dir.mkdir(parents=True, exist_ok=True)
-        tf = target_dir / f"__apo_write_test_{int(datetime.utcnow().timestamp())}.txt"
+        tf = target_dir / f"__apo_write_test_{int(time.time())}.txt"
         tf.write_text("ok", encoding="utf-8")
-        return {"ok": True, "path": str(tf)}
+        head = sorted(os.listdir(target_dir))[:20]
+        return {"ok": True, "path": str(tf), "ls_head": head}
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
 
 # --------------------------------------------------------------------------------------
 # DEV ENTRYPOINT
 # --------------------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-
-    # Auto-init plików na starcie (gdy deploy na "czysto")
+    # Łagodne auto-init plików na starcie (przy lokalnym dev)
     try:
-        _ensure_dirs_for(BULLETIN_PATH)
-        if not os.path.exists(BULLETIN_PATH):
-            with open(BULLETIN_PATH, "w", encoding="utf-8") as f:
-                json.dump({"items": [], "updated_at": None}, f, ensure_ascii=False, indent=2)
-        _ensure_dirs_for(DENYLIST_PATH)
-        if not os.path.exists(DENYLIST_PATH):
-            with open(DENYLIST_PATH, "w", encoding="utf-8") as f:
-                json.dump({"patterns": []}, f, ensure_ascii=False, indent=2)
+        for p, fallback in [
+            (BULLETIN_PATH, {"items": [], "updated_at": None}),
+            (DENYLIST_PATH, {"patterns": []}),
+            (KNOWLEDGE_INDEX_PATH, {"metadata": {}, "entries": []}),
+        ]:
+            _ensure_dirs_for(p)
+            if not os.path.exists(p):
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump(fallback, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
 
